@@ -1,0 +1,29 @@
+# Qwen3-TTS Audiobook Creator Pro v2.3
+# 크로스 플랫폼 지원 (Mac/Windows/Linux)
+
+# PyQt6 for native GUI
+PyQt6>=6.4.0
+PyQt6-Qt6>=6.4.0
+
+# Audio processing
+soundfile>=0.12.1
+numpy>=1.24.0
+
+# Document parsers (필수 - TXT/PDF/DOCX/EPUB/RTF 지원)
+pymupdf>=1.23.0      # PDF support
+python-docx>=0.8.11  # DOCX support
+ebooklib>=0.18       # EPUB support
+
+# AI/ML (시스템에 따라 다름 - 수동 설치 권장)
+# torch - CUDA/MPS/CPU 버전은 수동 설치 권장
+# qwen-tts - 별도 설치 필요
+
+# Windows:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 (CUDA)
+# pip install torch torchvision torchaudio (CPU)
+
+# Mac:
+# pip install torch torchvision torchaudio
+
+# qwen-tts 설치:
+# pip install qwen-tts
