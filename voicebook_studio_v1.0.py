@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QProgressBar, QComboBox, QSlider, QTextEdit,
     QMessageBox, QGroupBox, QSplitter, QTabWidget, QMenuBar, QDialog,
-    QCheckBox, QGridLayout
+    QCheckBox, QGridLayout, QLineEdit
 )
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QFont, QAction
@@ -143,8 +143,16 @@ class MainWindow(QMainWindow):
         text_layout.addWidget(self.text_input)
         
         input_tabs.addTab(text_tab, "✏️ 직접 입력")
-        
+
         layout.addWidget(input_tabs)
+
+        # 출력 파일명
+        output_name_layout = QHBoxLayout()
+        output_name_layout.addWidget(QLabel("출력 파일명:"))
+        self.output_name_input = QLineEdit()
+        self.output_name_input.setPlaceholderText("파일명을 입력하세요 (비워두면 원본 파일명 사용)")
+        output_name_layout.addWidget(self.output_name_input)
+        layout.addLayout(output_name_layout)
         
         # 스플리터
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -637,6 +645,7 @@ class MainWindow(QMainWindow):
                 self.filter_info.setText("ℹ️ 필터링 사용 안 함 - 원본 전체")
             
             self.file_label.setText(f"선택된 파일: {filename}")
+            self.output_name_input.setText(os.path.splitext(filename)[0])
             self.text_preview.setPlainText(self.filtered_text[:3000] + ("..." if len(self.filtered_text) > 3000 else ""))
             
             # 상태 메시지 업데이트
@@ -662,16 +671,24 @@ class MainWindow(QMainWindow):
     def start_conversion(self):
         if self.filtered_text:
             text = self.filtered_text
-            output_name = os.path.splitext(os.path.basename(self.current_file))[0] if self.current_file else "audiobook"
+            default_name = os.path.splitext(os.path.basename(self.current_file))[0] if self.current_file else "audiobook"
         else:
             text = self.text_input.toPlainText().strip()
             if not text:
                 QMessageBox.warning(self, "경고", "텍스트를 입력하거나 파일을 선택해주세요.")
                 return
-            output_name = "text_input"
+            # 첫 문장을 기본 파일명으로 사용
+            import re as _re
+            first_line = text.split('\n')[0].strip()
+            # 파일명에 사용 불가한 문자 제거, 30자 제한
+            default_name = _re.sub(r'[\\/*?:"<>|]', '', first_line)[:30].strip() or "text_input"
             # 직접 입력 시에도 언어 감지
             self.detect_and_set_language(text)
-        
+
+        # 사용자 지정 파일명 우선, 없으면 기본값
+        user_name = self.output_name_input.text().strip()
+        output_name = user_name if user_name else default_name
+
         self.output_file = os.path.join(self.output_dir, f"{output_name}_audiobook.wav")
 
         # 이전 세그먼트 파일 → temp 폴더로 이동 (복구 가능)
