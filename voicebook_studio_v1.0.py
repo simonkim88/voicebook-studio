@@ -7,7 +7,7 @@ import glob
 
 # 모듈 임포트
 from config_manager import load_config, save_config, get_device, DEFAULT_OUTPUT_DIR
-from document_parser import DocumentParser, VOICE_OPTIONS
+from document_parser import DocumentParser, VOICE_OPTIONS, load_custom_voices, CUSTOM_VOICE_PRESETS, get_all_voice_options
 from tts_worker import TTSWorker
 from ui_components import DropArea, SettingsDialog, LanguageConfirmDialog
 from language_detector import (
@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QProgressBar, QComboBox, QSlider, QTextEdit,
     QMessageBox, QGroupBox, QSplitter, QTabWidget, QMenuBar, QDialog,
-    QCheckBox
+    QCheckBox, QGridLayout
 )
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QFont, QAction
@@ -42,6 +42,9 @@ class MainWindow(QMainWindow):
         self.tts_worker = None
         self.playback_speed = 1.0
         
+        # 커스텀 음성 프리셋 로드
+        load_custom_voices()
+
         # 설정 로드
         self.config = load_config()
         self.output_dir = self.config.get("output_directory", DEFAULT_OUTPUT_DIR)
@@ -182,25 +185,148 @@ class MainWindow(QMainWindow):
         # 음성 설정
         settings_group = QGroupBox("음성 설정")
         settings_layout = QVBoxLayout(settings_group)
-        
+
         # 목소리
         voice_layout = QHBoxLayout()
         voice_layout.addWidget(QLabel("목소리:"))
         self.voice_combo = QComboBox()
+        # Built-in 음성
         for voice, language, description in VOICE_OPTIONS:
             self.voice_combo.addItem(f"{voice} ({language})", voice)
-        self.voice_combo.setCurrentIndex(8)
+        # 커스텀 음성 (구분자 + [Clone] 표시)
+        if CUSTOM_VOICE_PRESETS:
+            self.voice_combo.insertSeparator(self.voice_combo.count())
+            for voice_name, info in CUSTOM_VOICE_PRESETS.items():
+                label = f"[Clone] {voice_name} ({info['language']})"
+                self.voice_combo.addItem(label, voice_name)
+        self.voice_combo.setCurrentIndex(8)  # Sohee 기본값
+        self.voice_combo.currentIndexChanged.connect(self._on_voice_changed)
         voice_layout.addWidget(self.voice_combo)
         settings_layout.addLayout(voice_layout)
-        
+
+        # 목소리 설명 라벨
+        self.voice_desc_label = QLabel()
+        self.voice_desc_label.setStyleSheet("color: #666; font-size: 11px; margin-left: 10px;")
+        self.voice_desc_label.setWordWrap(True)
+        settings_layout.addWidget(self.voice_desc_label)
+        self._on_voice_changed()  # 초기값 설정
+
+        # ── 스타일 프리셋 ──
+        preset_label = QLabel("── 스타일 프리셋 ──")
+        preset_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preset_label.setStyleSheet("color: #555; font-weight: bold; margin-top: 6px;")
+        settings_layout.addWidget(preset_label)
+
+        self.preset_tabs = QTabWidget()
+        self.preset_tabs.setStyleSheet("QTabBar::tab { padding: 4px 8px; }")
+
+        # --- 기본 톤 탭 ---
+        basic_tab = QWidget()
+        basic_layout = self._create_flow_layout(basic_tab)
+        self.basic_presets = {
+            "자연스러운": "자연스럽고 편안한 톤으로 읽어주세요.",
+            "차분한": "차분하고 안정된 톤으로 읽어주세요. 감정 기복을 최소화해주세요.",
+            "밝은": "밝고 긍정적인 톤으로 읽어주세요. 활기차고 에너지 넘치는 느낌으로.",
+            "진지한": "진지하고 무게 있는 톤으로 읽어주세요. 단호하고 분명한 어조로.",
+            "감정적인": "감정이 풍부하고 표현력 있는 톤으로 읽어주세요. 문장의 감정을 살려서.",
+            "속삭이는": "부드럽고 조용한 속삭이듯한 톤으로 읽어주세요.",
+            "힘찬": "에너지 넘치고 힘차며 역동적인 톤으로 읽어주세요.",
+            "다정한": "따뜻하고 다정하며 부드러운 톤으로 읽어주세요.",
+        }
+        for idx, (name, prompt) in enumerate(self.basic_presets.items()):
+            btn = QPushButton(name)
+            btn.setCheckable(True)
+            btn.setStyleSheet(self._preset_btn_style())
+            btn.clicked.connect(lambda checked, p=prompt, b=btn: self._on_preset_clicked(p, b))
+            basic_layout.addWidget(btn, idx // 4, idx % 4)
+        self.preset_tabs.addTab(basic_tab, "기본 톤")
+
+        # --- 장르별 톤 탭 ---
+        genre_tab = QWidget()
+        genre_layout = self._create_flow_layout(genre_tab)
+        self.genre_presets = {
+            "역사/평전": "깊고 묵직하며 단호한 톤으로 읽어주세요. 과거의 무게감을 전달하는 느낌으로.",
+            "철학/뇌과학": "논리적이고 중립적이며 천천히 읽어주세요. 청자가 생각할 시간을 주는 건조하고 이성적인 톤으로.",
+            "자기계발": "자신감 있고 권위 있으며 명확한 톤으로 읽어주세요. 설득력 있는 전문가처럼.",
+            "소설/문학": "감정을 살리며 이야기하듯 자연스럽게 읽어주세요. 장면의 분위기에 맞게 톤을 변화시켜주세요.",
+            "뉴스/다큐": "차분하고 지적이며 안정된 톤으로 읽어주세요. 다큐멘터리 내레이터처럼 전문적인 나레이션 스타일로.",
+            "동화/어린이": "경쾌하고 재미있는 톤으로 읽어주세요. 아이에게 이야기해주듯 다정하고 생동감 있게.",
+        }
+        for idx, (name, prompt) in enumerate(self.genre_presets.items()):
+            btn = QPushButton(name)
+            btn.setCheckable(True)
+            btn.setStyleSheet(self._preset_btn_style())
+            btn.clicked.connect(lambda checked, p=prompt, b=btn: self._on_preset_clicked(p, b))
+            genre_layout.addWidget(btn, idx // 3, idx % 3)
+        self.preset_tabs.addTab(genre_tab, "장르별 톤")
+
+        # --- 상세 조절 탭 ---
+        detail_tab = QWidget()
+        detail_layout = QVBoxLayout(detail_tab)
+        detail_layout.setContentsMargins(4, 4, 4, 4)
+        detail_layout.setSpacing(4)
+
         # 톤
-        tone_layout = QHBoxLayout()
-        tone_layout.addWidget(QLabel("톤/느낌:"))
-        self.tone_combo = QComboBox()
-        self.tone_combo.addItems(["자연스러운", "차분한", "밝은", "진지한", "감정적인"])
-        tone_layout.addWidget(self.tone_combo)
-        settings_layout.addLayout(tone_layout)
-        
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("톤:"))
+        self.detail_tone = QComboBox()
+        self.detail_tone.addItems(["차분한", "자연스러운", "밝은", "진지한", "감정적인", "속삭이는"])
+        self.detail_tone.currentIndexChanged.connect(self._update_detail_prompt)
+        row1.addWidget(self.detail_tone)
+        detail_layout.addLayout(row1)
+
+        # 속도
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("속도:"))
+        self.detail_speed = QComboBox()
+        self.detail_speed.addItems(["천천히", "보통", "빠르게"])
+        self.detail_speed.setCurrentIndex(1)
+        self.detail_speed.currentIndexChanged.connect(self._update_detail_prompt)
+        row2.addWidget(self.detail_speed)
+        detail_layout.addLayout(row2)
+
+        # 감정
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("감정:"))
+        self.detail_emotion = QComboBox()
+        self.detail_emotion.addItems(["절제된", "보통", "풍부한"])
+        self.detail_emotion.setCurrentIndex(1)
+        self.detail_emotion.currentIndexChanged.connect(self._update_detail_prompt)
+        row3.addWidget(self.detail_emotion)
+        detail_layout.addLayout(row3)
+
+        # 음높이
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("음높이:"))
+        self.detail_pitch = QComboBox()
+        self.detail_pitch.addItems(["낮게", "보통", "높게"])
+        self.detail_pitch.setCurrentIndex(1)
+        self.detail_pitch.currentIndexChanged.connect(self._update_detail_prompt)
+        row4.addWidget(self.detail_pitch)
+        detail_layout.addLayout(row4)
+
+        self.preset_tabs.addTab(detail_tab, "상세 조절")
+        self.preset_tabs.currentChanged.connect(self._on_preset_tab_changed)
+
+        settings_layout.addWidget(self.preset_tabs)
+
+        # ── 음성 프롬프트 ──
+        prompt_label = QLabel("── 음성 프롬프트 ──")
+        prompt_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        prompt_label.setStyleSheet("color: #555; font-weight: bold; margin-top: 6px;")
+        settings_layout.addWidget(prompt_label)
+
+        self.instruct_edit = QTextEdit()
+        self.instruct_edit.setPlaceholderText("음성 스타일 지시를 입력하세요...")
+        self.instruct_edit.setMaximumHeight(70)
+        self.instruct_edit.setText("자연스럽고 편안한 톤으로 읽어주세요.")
+        settings_layout.addWidget(self.instruct_edit)
+
+        instruct_hint = QLabel("위 프리셋을 선택하면 자동으로 채워집니다. 직접 수정도 가능합니다.")
+        instruct_hint.setStyleSheet("color: #888; font-size: 10px;")
+        instruct_hint.setWordWrap(True)
+        settings_layout.addWidget(instruct_hint)
+
         # 볼륨
         volume_layout = QHBoxLayout()
         volume_layout.addWidget(QLabel("볼륨:"))
@@ -346,7 +472,7 @@ class MainWindow(QMainWindow):
         
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
-        splitter.setSizes([350, 650])
+        splitter.setSizes([450, 550])
         
         layout.addWidget(splitter)
         
@@ -355,6 +481,65 @@ class MainWindow(QMainWindow):
         footer.setStyleSheet("color: #999; font-size: 12px;")
         layout.addWidget(footer)
     
+    # ── 음성 설정 헬퍼 메서드 ──
+
+    def _preset_btn_style(self):
+        return """
+            QPushButton { padding: 5px 10px; border: 1px solid #ccc; border-radius: 4px; }
+            QPushButton:hover { background-color: #e0e0e0; }
+            QPushButton:checked { background-color: #007AFF; color: white; border-color: #007AFF; }
+        """
+
+    def _create_flow_layout(self, parent):
+        """프리셋 버튼용 그리드 레이아웃"""
+        layout = QGridLayout(parent)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        return layout
+
+    def _on_voice_changed(self):
+        idx = self.voice_combo.currentIndex()
+        voice_name = self.voice_combo.currentData()
+        if voice_name and voice_name in CUSTOM_VOICE_PRESETS:
+            desc = CUSTOM_VOICE_PRESETS[voice_name]["description"]
+            self.voice_desc_label.setText(f'  "{desc}"')
+        elif 0 <= idx < len(VOICE_OPTIONS):
+            _, _, desc = VOICE_OPTIONS[idx]
+            self.voice_desc_label.setText(f'  "{desc}"')
+
+    def _uncheck_all_presets(self):
+        """모든 프리셋 버튼의 체크 해제"""
+        for tab_idx in range(self.preset_tabs.count()):
+            tab = self.preset_tabs.widget(tab_idx)
+            for btn in tab.findChildren(QPushButton):
+                if btn.isCheckable():
+                    btn.setChecked(False)
+
+    def _on_preset_clicked(self, prompt, clicked_btn):
+        self._uncheck_all_presets()
+        clicked_btn.setChecked(True)
+        self.instruct_edit.setText(prompt)
+
+    def _on_preset_tab_changed(self, index):
+        """상세 조절 탭으로 전환 시 프롬프트 자동 생성"""
+        if index == 2:  # 상세 조절 탭
+            self._update_detail_prompt()
+
+    def _update_detail_prompt(self):
+        """상세 조절 드롭다운 조합으로 프롬프트 생성"""
+        tone = self.detail_tone.currentText()
+        speed = self.detail_speed.currentText()
+        emotion = self.detail_emotion.currentText()
+        pitch = self.detail_pitch.currentText()
+
+        speed_map = {"천천히": "천천히", "보통": "보통 속도로", "빠르게": "빠르게"}
+        emotion_map = {"절제된": "감정을 절제하며", "보통": "적당한 감정으로", "풍부한": "감정을 풍부하게 살려"}
+        pitch_map = {"낮게": "약간 낮은 음높이로", "보통": "보통 음높이로", "높게": "약간 높은 음높이로"}
+
+        prompt = f"{tone} 톤으로, {speed_map[speed]}, {emotion_map[emotion]}, {pitch_map[pitch]} 읽어주세요."
+        self._uncheck_all_presets()
+        self.instruct_edit.setText(prompt)
+
     def on_language_changed(self, index):
         """언어 선택 변경 시 설정 저장"""
         lang_code = self.lang_combo.currentData()
@@ -488,7 +673,30 @@ class MainWindow(QMainWindow):
             self.detect_and_set_language(text)
         
         self.output_file = os.path.join(self.output_dir, f"{output_name}_audiobook.wav")
-        
+
+        # 이전 세그먼트 파일 → temp 폴더로 이동 (복구 가능)
+        base_path = self.output_file.replace('.wav', '')
+        old_segments = glob.glob(f"{base_path}_*.wav") + glob.glob(f"{base_path}_*.mp3")
+        if old_segments:
+            import shutil
+            from datetime import datetime
+            temp_dir = os.path.join(self.output_dir, "temp",
+                                    datetime.now().strftime("%Y%m%d_%H%M%S"))
+            os.makedirs(temp_dir, exist_ok=True)
+            for f in old_segments:
+                try:
+                    shutil.move(f, os.path.join(temp_dir, os.path.basename(f)))
+                except OSError:
+                    pass
+            # 메인 파일도 이동 (wav/mp3 모두)
+            for main_ext in ['.wav', '.mp3']:
+                main_file = base_path + main_ext
+                if os.path.exists(main_file):
+                    try:
+                        shutil.move(main_file, os.path.join(temp_dir, os.path.basename(main_file)))
+                    except OSError:
+                        pass
+
         self.convert_btn.setEnabled(False)
         self.convert_btn.setText("변환 중...")
         self.stop_convert_btn.setEnabled(True)  # 중지 버튼 활성화
@@ -496,13 +704,21 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.eta_label.setText("시간 계산 중...")
         
-        tone_map = {"자연스러운": "natural", "차분한": "calm", "밝은": "happy", "진지한": "serious", "감정적인": "emotional"}
-        tone = tone_map.get(self.tone_combo.currentText(), "natural")
         voice = self.voice_combo.currentData()
-        
+        instruct_text = self.instruct_edit.toPlainText().strip()
+
+        # 커스텀 음성 여부 판단
+        is_custom = voice in CUSTOM_VOICE_PRESETS
+        ref_audio_path = None
+        ref_text = None
+        if is_custom:
+            ref_audio_path = CUSTOM_VOICE_PRESETS[voice]["ref_audio_path"]
+            ref_text = CUSTOM_VOICE_PRESETS[voice]["ref_text"]
+
         self.tts_worker = TTSWorker(
             text=text, output_path=self.output_file,
-            voice=voice, tone=tone, device=self.device
+            voice=voice, instruct_text=instruct_text, device=self.device,
+            is_custom_voice=is_custom, ref_audio_path=ref_audio_path, ref_text=ref_text,
         )
         self.tts_worker.progress.connect(self.update_progress)
         self.tts_worker.status.connect(self.update_status)
@@ -534,8 +750,8 @@ class MainWindow(QMainWindow):
         
         self.player.setPlaybackRate(self.playback_speed)
         
-        base_path = output_path.replace('.wav', '')
-        segment_files = sorted(glob.glob(f"{base_path}_*.wav"))
+        base_path = output_path.replace('.mp3', '').replace('.wav', '')
+        segment_files = sorted(glob.glob(f"{base_path}_*.mp3") + glob.glob(f"{base_path}_*.wav"))
         
         if segment_files:
             num_files = len(segment_files) + 1
@@ -656,9 +872,10 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     
-    font = QFont("SF Pro" if sys.platform == "darwin" else "Segoe UI", 13)
-    if not QFont(font).exactMatch():
-        font = QFont("Arial", 13)
+    if sys.platform == "darwin":
+        font = QFont("SF Pro", 13)
+    else:
+        font = QFont("맑은 고딕", 10)
     app.setFont(font)
     
     window = MainWindow()

@@ -1,6 +1,7 @@
 # document_parser.py - 문서 파싱 모듈
 import os
 import re
+import json
 
 # 문서 파서 임포트
 try:
@@ -34,7 +35,7 @@ class DocumentParser:
             try:
                 with open(filepath, 'r', encoding=encoding) as f:
                     return f.read()
-            except UnicodeDecodeError:
+            except (UnicodeDecodeError, LookupError):
                 continue
         raise Exception("파일 인코딩을 감지할 수 없습니다.")
     
@@ -183,3 +184,121 @@ VOICE_OPTIONS = [
     ("Ono_Anna", "Japanese", "경쾌하고 재치 있는 일본 여성 목소리"),
     ("Sohee", "Korean", "풍부한 감정의 따뜻한 한국 여성 목소리")
 ]
+
+# 커스텀 음성 프리셋 (voices/ 디렉토리에서 로드)
+CUSTOM_VOICE_PRESETS = {}
+
+VOICES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voices")
+
+
+def _convert_to_wav(src_path, voice_dir):
+    """비-wav 오디오 파일을 wav로 변환 (앞쪽 무음 제거 포함)"""
+    import numpy as np
+    try:
+        import av
+        import soundfile as sf
+    except ImportError:
+        print(f"[warn] PyAV 또는 soundfile 미설치 - {src_path} 변환 불가")
+        return None
+
+    wav_path = os.path.join(voice_dir, "reference.wav")
+    try:
+        container = av.open(src_path)
+        stream = container.streams.audio[0]
+        sr = stream.rate or stream.codec_context.sample_rate
+
+        frames = []
+        for frame in container.decode(audio=0):
+            arr = frame.to_ndarray()
+            if arr.ndim > 1:
+                arr = arr.mean(axis=0)
+            frames.append(arr)
+        container.close()
+
+        audio = np.concatenate(frames).astype(np.float32)
+        if audio.max() > 1.0 or audio.min() < -1.0:
+            audio = audio / 32768.0
+
+        # 앞쪽 무음 제거
+        threshold = 0.01
+        abs_audio = np.abs(audio)
+        window = int(sr * 0.02)
+        smoothed = np.convolve(abs_audio, np.ones(window) / window, mode='same')
+        nonsilent = np.where(smoothed > threshold)[0]
+        if len(nonsilent) > 0:
+            start = max(0, nonsilent[0] - int(sr * 0.05))
+            audio = audio[start:]
+
+        sf.write(wav_path, audio, sr)
+        print(f"[info] 변환 완료: {os.path.basename(src_path)} -> reference.wav ({len(audio)/sr:.1f}s)")
+        return wav_path
+    except Exception as e:
+        print(f"[warn] 오디오 변환 실패 ({src_path}): {e}")
+        return None
+
+
+def load_custom_voices():
+    """voices/ 디렉토리에서 커스텀 음성 프리셋을 로드"""
+    CUSTOM_VOICE_PRESETS.clear()
+
+    if not os.path.isdir(VOICES_DIR):
+        return CUSTOM_VOICE_PRESETS
+
+    for voice_dir_name in os.listdir(VOICES_DIR):
+        voice_dir = os.path.join(VOICES_DIR, voice_dir_name)
+        preset_path = os.path.join(voice_dir, "preset.json")
+
+        if not os.path.isdir(voice_dir) or not os.path.isfile(preset_path):
+            continue
+
+        try:
+            with open(preset_path, 'r', encoding='utf-8') as f:
+                preset = json.load(f)
+        except Exception:
+            continue
+
+        # 참조 오디오 파일 찾기
+        ref_audio_path = None
+        # preset.json에 ref_audio 필드가 있으면 우선 사용
+        if preset.get("ref_audio"):
+            candidate = os.path.join(voice_dir, preset["ref_audio"])
+            if os.path.isfile(candidate):
+                ref_audio_path = candidate
+        # 없으면 reference.* 패턴으로 폴백
+        if ref_audio_path is None:
+            for ext in ('.wav', '.m4a', '.mp3', '.flac', '.ogg'):
+                candidate = os.path.join(voice_dir, f"reference{ext}")
+                if os.path.isfile(candidate):
+                    ref_audio_path = candidate
+                    break
+
+        if ref_audio_path is None:
+            continue
+
+        # 비-wav 파일이면 wav로 자동 변환
+        if ref_audio_path and not ref_audio_path.lower().endswith('.wav'):
+            converted = _convert_to_wav(ref_audio_path, voice_dir)
+            if converted:
+                ref_audio_path = converted
+            else:
+                continue  # 변환 실패 시 건너뜀
+
+        voice_name = preset.get("name", voice_dir_name)
+        CUSTOM_VOICE_PRESETS[voice_name] = {
+            "ref_audio_path": ref_audio_path,
+            "ref_text": preset.get("ref_text", ""),
+            "lang_code": preset.get("lang_code", "ko"),
+            "language": preset.get("language", "Korean"),
+            "description": preset.get("description", "커스텀 보이스 클론"),
+            "is_custom": True,
+        }
+
+    return CUSTOM_VOICE_PRESETS
+
+
+def get_all_voice_options():
+    """built-in + custom 음성 목록을 합쳐서 반환"""
+    all_voices = list(VOICE_OPTIONS)
+    for voice_name, info in CUSTOM_VOICE_PRESETS.items():
+        all_voices.append((voice_name, info["language"], info["description"]))
+    return all_voices

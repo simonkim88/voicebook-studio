@@ -1,0 +1,9 @@
+{
+  "name": "chisoo",
+  "language": "Korean",
+  "lang_code": "ko",
+  "description": "크로스링구얼 보이스 클론 - 자연스러운 한국어 음성",
+  "ref_audio": "reference.wav",
+  "ref_text": "광활한 우주 속에, 지구라고 불리는 아름다운 푸른 행성이 있습니다.",
+  "is_custom": true
+}
