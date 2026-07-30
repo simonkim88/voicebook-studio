@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QProgressBar, QComboBox, QSlider, QTextEdit,
     QMessageBox, QGroupBox, QSplitter, QTabWidget, QMenuBar, QDialog,
-    QCheckBox, QGridLayout, QLineEdit, QRadioButton, QButtonGroup
+    QCheckBox, QGridLayout, QLineEdit, QRadioButton, QButtonGroup, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QFont, QAction
@@ -37,8 +37,10 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AI 오디오북 생성기 Pro v2.4 - Language Aware")
-        self.setGeometry(100, 100, 1000, 850)
+        self.setWindowTitle("AI 오디오북 생성기 Pro v2.5 - Language Aware")
+        # 가로로 넓게 3열 배치 → 전체 UI가 세로 스크롤 없이 한눈에 들어온다
+        self.setGeometry(80, 60, 1440, 820)
+        self.setMinimumSize(1100, 640)
         
         # 상태 변수
         self.current_file = None
@@ -80,36 +82,44 @@ class MainWindow(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
-        layout.setSpacing(15)
-        layout.setContentsMargins(20, 20, 20, 20)
-        
-        # 제목
-        title = QLabel("📚 AI 오디오북 생성기 Pro v2.4")
+        layout.setSpacing(8)
+        layout.setContentsMargins(14, 10, 14, 10)
+
+        # ── 헤더: 제목 + 시스템 정보를 한 줄에 (세로 공간 절약) ──
+        header_layout = QHBoxLayout()
+
+        title = QLabel("📚 AI 오디오북 생성기 Pro")
         title_font = QFont()
-        title_font.setPointSize(24)
+        title_font.setPointSize(17)
         title_font.setBold(True)
         title.setFont(title_font)
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
-        
+        header_layout.addWidget(title)
+
         subtitle = QLabel("Language Auto-Detection + Smart Content Filter")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setStyleSheet("color: #666;")
-        layout.addWidget(subtitle)
-        
-        # 시스템 정보
-        info_layout = QHBoxLayout()
+        subtitle.setStyleSheet("color: #666; font-size: 11px;")
+        header_layout.addWidget(subtitle)
+
+        header_layout.addStretch()
+
         self.folder_label = QLabel(f"📁 저장: {os.path.normpath(self.output_dir)}")
-        self.folder_label.setStyleSheet("color: #007AFF; font-size: 12px;")
-        info_layout.addWidget(self.folder_label)
-        
-        self.device_label = QLabel(f"⚙️ 디바이스: {self.device.upper()}")
-        self.device_label.setStyleSheet("color: #28a745; font-size: 12px;")
-        info_layout.addWidget(self.device_label)
-        
-        info_layout.addStretch()
-        layout.addLayout(info_layout)
-        
+        self.folder_label.setStyleSheet("color: #007AFF; font-size: 11px;")
+        header_layout.addWidget(self.folder_label)
+
+        self.device_label = QLabel(f"⚙️ {self.device.upper()}")
+        self.device_label.setStyleSheet("color: #28a745; font-size: 11px;")
+        header_layout.addWidget(self.device_label)
+
+        layout.addLayout(header_layout)
+
+        # ── 3열 스플리터: 입력 | 설정 | 실행 ──
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # ── 1열: 입력 & 출력 ──
+        input_panel = QWidget()
+        input_layout = QVBoxLayout(input_panel)
+        input_layout.setContentsMargins(0, 0, 6, 0)
+        input_layout.setSpacing(8)
+
         # 입력 방식 탭
         input_tabs = QTabWidget()
         
@@ -119,7 +129,9 @@ class MainWindow(QMainWindow):
         
         self.drop_area = DropArea()
         self.drop_area.file_dropped.connect(self.on_file_dropped)
-        file_layout.addWidget(self.drop_area)
+        # 남는 세로 공간을 드롭 영역이 채우도록 (드롭 타깃도 넓어짐)
+        self.drop_area.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        file_layout.addWidget(self.drop_area, 1)
         
         self.file_label = QLabel("선택된 파일: 없음")
         self.file_label.setWordWrap(True)
@@ -146,20 +158,20 @@ class MainWindow(QMainWindow):
         
         self.text_input = QTextEdit()
         self.text_input.setPlaceholderText("여기에 텍스트를 입력하거나 붙여넣기 하세요...")
-        self.text_input.setMinimumHeight(200)
+        self.text_input.setMinimumHeight(120)
         text_layout.addWidget(self.text_input)
-        
+
         input_tabs.addTab(text_tab, "✏️ 직접 입력")
 
-        layout.addWidget(input_tabs)
+        input_layout.addWidget(input_tabs)
 
         # 출력 파일명
         output_name_layout = QHBoxLayout()
         output_name_layout.addWidget(QLabel("출력 파일명:"))
         self.output_name_input = QLineEdit()
-        self.output_name_input.setPlaceholderText("파일명을 입력하세요 (비워두면 원본 파일명 사용)")
+        self.output_name_input.setPlaceholderText("비워두면 원본 파일명 사용")
         output_name_layout.addWidget(self.output_name_input)
-        layout.addLayout(output_name_layout)
+        input_layout.addLayout(output_name_layout)
 
         # 출력 형식 (오디오만 / 오디오 + 자막)
         output_format_group = QGroupBox("출력 형식")
@@ -191,17 +203,19 @@ class MainWindow(QMainWindow):
             "  매칭이 가장 정확합니다. 대신 파일 하나가 매우 커집니다."
         )
         output_format_desc.setStyleSheet("color: #666; font-size: 11px;")
+        output_format_desc.setWordWrap(True)
         output_format_layout.addWidget(output_format_desc)
 
-        layout.addWidget(output_format_group)
+        input_layout.addWidget(output_format_group)
+        # 입력 탭이 남는 세로 공간을 채우도록 (아래 빈 공간 제거)
+        input_layout.setStretchFactor(input_tabs, 1)
 
-        # 스플리터
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        
-        # 왼쪽 패널
+        # ── 2열: 설정 ──
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        
+        left_layout.setContentsMargins(6, 0, 6, 0)
+        left_layout.setSpacing(8)
+
         # 언어 설정 (NEW!)
         lang_group = QGroupBox("언어 설정")
         lang_layout = QVBoxLayout(lang_group)
@@ -228,9 +242,7 @@ class MainWindow(QMainWindow):
                           "• 수동 선택: 특정 언어로 강제 지정")
         lang_desc.setStyleSheet("color: #666; font-size: 11px;")
         lang_layout.addWidget(lang_desc)
-        
-        left_layout.addWidget(lang_group)
-        
+
         # 모델 설정
         model_group = QGroupBox("모델 설정")
         model_layout = QVBoxLayout(model_group)
@@ -273,8 +285,6 @@ class MainWindow(QMainWindow):
                             "• 0.6B: 빠른 속도, 낮은 VRAM 사용")
         self.model_desc.setStyleSheet("color: #666; font-size: 11px;")
         model_layout.addWidget(self.model_desc)
-
-        left_layout.addWidget(model_group)
 
         # 음성 설정
         settings_group = QGroupBox("음성 설정")
@@ -443,24 +453,27 @@ class MainWindow(QMainWindow):
         filter_desc.setWordWrap(True)
         filter_layout.addWidget(filter_desc)
         
+        left_layout.addWidget(model_group)
         left_layout.addWidget(lang_group)
         left_layout.addWidget(settings_group)
         left_layout.addWidget(filter_group)
-        
         left_layout.addStretch()
-        
-        # 오른쪽 패널
+
+        # ── 3열: 실행 & 재생 ──
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
-        
+        right_layout.setContentsMargins(6, 0, 0, 0)
+        right_layout.setSpacing(8)
+
         preview_group = QGroupBox("텍스트 미리보기")
         preview_layout = QVBoxLayout(preview_group)
         self.text_preview = QTextEdit()
         self.text_preview.setReadOnly(True)
         self.text_preview.setPlaceholderText("여기에 텍스트 내용이 표시됩니다...")
-        self.text_preview.setMaximumHeight(200)
+        self.text_preview.setMinimumHeight(160)
         preview_layout.addWidget(self.text_preview)
-        right_layout.addWidget(preview_group)
+        # 미리보기가 남는 세로 공간을 채우도록 (아래 빈 공간 제거)
+        right_layout.addWidget(preview_group, 1)
 
         # 변환/중지 버튼 레이아웃
         convert_layout = QHBoxLayout()
@@ -547,17 +560,18 @@ class MainWindow(QMainWindow):
         player_layout.addLayout(btn_layout)
         
         right_layout.addWidget(player_group)
-        right_layout.addStretch()
-        
+
+        splitter.addWidget(input_panel)
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
-        splitter.setSizes([450, 550])
-        
+        splitter.setSizes([460, 470, 470])
+        splitter.setChildrenCollapsible(False)
+
         layout.addWidget(splitter)
-        
-        footer = QLabel("💡 v2.4 Language Aware | 자동 언어 감지 + 스마트 필터")
+
+        footer = QLabel("💡 v2.5 | 자동 언어 감지 + 스마트 필터 + 자막(.srt) 출력")
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        footer.setStyleSheet("color: #999; font-size: 12px;")
+        footer.setStyleSheet("color: #999; font-size: 11px;")
         layout.addWidget(footer)
 
         # 저장된 엔진에 맞춰 초기 UI 상태 적용

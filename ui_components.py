@@ -27,7 +27,7 @@ class DropArea(QLabel):
             QLabel {
                 border: 3px dashed #6b7280;
                 border-radius: 16px;
-                padding: 40px;
+                padding: 22px;
                 background: qlineargradient(
                     x1: 0, y1: 0, x2: 1, y2: 1,
                     stop: 0 #f0f4f8,
@@ -42,7 +42,7 @@ class DropArea(QLabel):
                         rgba(107, 114, 128, 0.03) 10px,
                         rgba(107, 114, 128, 0.03) 20px
                     );
-                font-size: 15px;
+                font-size: 13px;
                 color: #4b5563;
                 font-weight: 500;
             }
@@ -58,7 +58,7 @@ class DropArea(QLabel):
             }
         """)
         self.setAcceptDrops(True)
-        self.setMinimumHeight(180)
+        self.setMinimumHeight(130)
     
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
