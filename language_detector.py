@@ -90,10 +90,18 @@ def get_language_name(lang_code: str, korean: bool = True) -> str:
 
 
 def get_recommended_voices(lang_code: str) -> list:
-    """해당 언어에 추천되는 목소리 목록 반환"""
+    """해당 언어에 추천되는 목소리 목록 반환 (built-in + custom)"""
+    voices = []
     if lang_code in LANGUAGE_PATTERNS:
-        return LANGUAGE_PATTERNS[lang_code]['recommended_voices']
-    return []
+        voices = list(LANGUAGE_PATTERNS[lang_code]['recommended_voices'])
+
+    # 커스텀 음성 중 해당 언어의 음성 추가
+    from document_parser import CUSTOM_VOICE_PRESETS
+    for voice_name, info in CUSTOM_VOICE_PRESETS.items():
+        if info.get('lang_code') == lang_code:
+            voices.append(voice_name)
+
+    return voices
 
 
 def get_voice_language(voice_name: str) -> str:
@@ -109,7 +117,15 @@ def get_voice_language(voice_name: str) -> str:
         'Eric': 'zh',
         'Ono_Anna': 'ja',
     }
-    return voice_to_lang.get(voice_name, 'unknown')
+    if voice_name in voice_to_lang:
+        return voice_to_lang[voice_name]
+
+    # 커스텀 음성 프리셋에서 검색
+    from document_parser import CUSTOM_VOICE_PRESETS
+    if voice_name in CUSTOM_VOICE_PRESETS:
+        return CUSTOM_VOICE_PRESETS[voice_name].get('lang_code', 'unknown')
+
+    return 'unknown'
 
 
 def check_language_mismatch(text: str, selected_voice: str) -> Tuple[bool, str, str]:

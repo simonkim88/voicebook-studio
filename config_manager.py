@@ -19,6 +19,17 @@ def get_default_device():
     except:
         return "cpu"
 
+MODEL_SIZE_OPTIONS = [
+    ("1.7B", "1.7B (고품질, VRAM 많이 사용)"),
+    ("0.6B", "0.6B (경량, VRAM 적게 사용)"),
+]
+
+# TTS 엔진 선택 (Qwen3-TTS / Kokoro-82M)
+TTS_ENGINE_OPTIONS = [
+    ("qwen", "Qwen3-TTS (다국어·한국어 지원, 스타일 프롬프트 지원)"),
+    ("kokoro", "Kokoro-82M (영어 전용, 경량·고속, 스타일 프롬프트 미지원)"),
+]
+
 def get_default_config():
     """기본 설정 반환"""
     return {
@@ -27,7 +38,9 @@ def get_default_config():
         "default_tone": "natural",
         "default_volume": 70,
         "device": "auto",  # auto, cpu, cuda, mps
-        "custom_device": None  # auto가 아닐 경우 사용
+        "custom_device": None,  # auto가 아닐 경우 사용
+        "model_size": "1.7B",  # 1.7B 또는 0.6B
+        "tts_engine": "qwen",  # qwen 또는 kokoro
     }
 
 def load_config():

@@ -6,8 +6,14 @@ import os
 import glob
 
 # 모듈 임포트
-from config_manager import load_config, save_config, get_device, DEFAULT_OUTPUT_DIR
-from document_parser import DocumentParser, VOICE_OPTIONS, load_custom_voices, CUSTOM_VOICE_PRESETS, get_all_voice_options
+from config_manager import (
+    load_config, save_config, get_device, DEFAULT_OUTPUT_DIR,
+    MODEL_SIZE_OPTIONS, TTS_ENGINE_OPTIONS
+)
+from document_parser import (
+    DocumentParser, VOICE_OPTIONS, load_custom_voices, CUSTOM_VOICE_PRESETS,
+    get_all_voice_options, KOKORO_VOICE_OPTIONS, KOKORO_VOICES
+)
 from tts_worker import TTSWorker
 from ui_components import DropArea, SettingsDialog, LanguageConfirmDialog
 from language_detector import (
@@ -92,7 +98,7 @@ class MainWindow(QMainWindow):
         
         # 시스템 정보
         info_layout = QHBoxLayout()
-        self.folder_label = QLabel(f"📁 저장: {self.output_dir}")
+        self.folder_label = QLabel(f"📁 저장: {os.path.normpath(self.output_dir)}")
         self.folder_label.setStyleSheet("color: #007AFF; font-size: 12px;")
         info_layout.addWidget(self.folder_label)
         
@@ -190,6 +196,51 @@ class MainWindow(QMainWindow):
         
         left_layout.addWidget(lang_group)
         
+        # 모델 설정
+        model_group = QGroupBox("모델 설정")
+        model_layout = QVBoxLayout(model_group)
+
+        # TTS 엔진 선택
+        engine_layout = QHBoxLayout()
+        engine_layout.addWidget(QLabel("TTS 엔진:"))
+        self.engine_combo = QComboBox()
+        for engine_id, engine_name in TTS_ENGINE_OPTIONS:
+            self.engine_combo.addItem(engine_name, engine_id)
+
+        saved_engine = self.config.get("tts_engine", "qwen")
+        for i in range(self.engine_combo.count()):
+            if self.engine_combo.itemData(i) == saved_engine:
+                self.engine_combo.setCurrentIndex(i)
+                break
+
+        self.engine_combo.currentIndexChanged.connect(self.on_engine_changed)
+        engine_layout.addWidget(self.engine_combo)
+        model_layout.addLayout(engine_layout)
+
+        model_size_layout = QHBoxLayout()
+        self.model_size_label = QLabel("모델 크기:")
+        model_size_layout.addWidget(self.model_size_label)
+        self.model_size_combo = QComboBox()
+        for size_id, size_name in MODEL_SIZE_OPTIONS:
+            self.model_size_combo.addItem(size_name, size_id)
+
+        saved_model_size = self.config.get("model_size", "1.7B")
+        for i in range(self.model_size_combo.count()):
+            if self.model_size_combo.itemData(i) == saved_model_size:
+                self.model_size_combo.setCurrentIndex(i)
+                break
+
+        self.model_size_combo.currentIndexChanged.connect(self.on_model_size_changed)
+        model_size_layout.addWidget(self.model_size_combo)
+        model_layout.addLayout(model_size_layout)
+
+        self.model_desc = QLabel("• 1.7B: 높은 품질, VRAM ~4GB 이상 권장\n"
+                            "• 0.6B: 빠른 속도, 낮은 VRAM 사용")
+        self.model_desc.setStyleSheet("color: #666; font-size: 11px;")
+        model_layout.addWidget(self.model_desc)
+
+        left_layout.addWidget(model_group)
+
         # 음성 설정
         settings_group = QGroupBox("음성 설정")
         settings_layout = QVBoxLayout(settings_group)
@@ -198,16 +249,7 @@ class MainWindow(QMainWindow):
         voice_layout = QHBoxLayout()
         voice_layout.addWidget(QLabel("목소리:"))
         self.voice_combo = QComboBox()
-        # Built-in 음성
-        for voice, language, description in VOICE_OPTIONS:
-            self.voice_combo.addItem(f"{voice} ({language})", voice)
-        # 커스텀 음성 (구분자 + [Clone] 표시)
-        if CUSTOM_VOICE_PRESETS:
-            self.voice_combo.insertSeparator(self.voice_combo.count())
-            for voice_name, info in CUSTOM_VOICE_PRESETS.items():
-                label = f"[Clone] {voice_name} ({info['language']})"
-                self.voice_combo.addItem(label, voice_name)
-        self.voice_combo.setCurrentIndex(8)  # Sohee 기본값
+        self._rebuild_voice_combo()  # 엔진에 맞는 음성 목록 채우기
         self.voice_combo.currentIndexChanged.connect(self._on_voice_changed)
         voice_layout.addWidget(self.voice_combo)
         settings_layout.addLayout(voice_layout)
@@ -370,15 +412,24 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(settings_group)
         left_layout.addWidget(filter_group)
         
-        # 설정 변경 버튼
-        change_folder_btn = QPushButton("📁 저장 폴더 변경...")
-        change_folder_btn.clicked.connect(self.open_settings)
-        left_layout.addWidget(change_folder_btn)
+        left_layout.addStretch()
         
+        # 오른쪽 패널
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        
+        preview_group = QGroupBox("텍스트 미리보기")
+        preview_layout = QVBoxLayout(preview_group)
+        self.text_preview = QTextEdit()
+        self.text_preview.setReadOnly(True)
+        self.text_preview.setPlaceholderText("여기에 텍스트 내용이 표시됩니다...")
+        self.text_preview.setMaximumHeight(200)
+        preview_layout.addWidget(self.text_preview)
+        right_layout.addWidget(preview_group)
+
         # 변환/중지 버튼 레이아웃
         convert_layout = QHBoxLayout()
-        
-        # 변환 버튼
+
         self.convert_btn = QPushButton("🎙️ 음성 변환 시작")
         self.convert_btn.setStyleSheet("""
             QPushButton {
@@ -391,8 +442,7 @@ class MainWindow(QMainWindow):
         """)
         self.convert_btn.clicked.connect(self.start_conversion)
         convert_layout.addWidget(self.convert_btn)
-        
-        # 중지 버튼
+
         self.stop_convert_btn = QPushButton("⏹️ 중지")
         self.stop_convert_btn.setStyleSheet("""
             QPushButton {
@@ -404,39 +454,30 @@ class MainWindow(QMainWindow):
             QPushButton:disabled { background-color: #999; }
         """)
         self.stop_convert_btn.clicked.connect(self.stop_conversion)
-        self.stop_convert_btn.setEnabled(False)  # 초기에는 비활성화
+        self.stop_convert_btn.setEnabled(False)
         convert_layout.addWidget(self.stop_convert_btn)
-        
-        left_layout.addLayout(convert_layout)
-        
+
+        right_layout.addLayout(convert_layout)
+
         # 진행 상황
         self.status_label = QLabel("텍스트를 입력하거나 파일을 선택해주세요")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        left_layout.addWidget(self.status_label)
-        
+        right_layout.addWidget(self.status_label)
+
         self.eta_label = QLabel("")
         self.eta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.eta_label.setStyleSheet("color: #28a745; font-size: 13px;")
-        left_layout.addWidget(self.eta_label)
-        
+        right_layout.addWidget(self.eta_label)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        left_layout.addWidget(self.progress_bar)
-        
-        left_layout.addStretch()
-        
-        # 오른쪽 패널
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        
-        preview_group = QGroupBox("텍스트 미리보기")
-        preview_layout = QVBoxLayout(preview_group)
-        self.text_preview = QTextEdit()
-        self.text_preview.setReadOnly(True)
-        self.text_preview.setPlaceholderText("여기에 텍스트 내용이 표시됩니다...")
-        preview_layout.addWidget(self.text_preview)
-        right_layout.addWidget(preview_group)
-        
+        right_layout.addWidget(self.progress_bar)
+
+        # 저장 폴더 변경 버튼
+        change_folder_btn = QPushButton("📁 저장 폴더 변경...")
+        change_folder_btn.clicked.connect(self.open_settings)
+        right_layout.addWidget(change_folder_btn)
+
         player_group = QGroupBox("재생 컨트롤")
         player_layout = QVBoxLayout(player_group)
         
@@ -470,11 +511,6 @@ class MainWindow(QMainWindow):
         
         player_layout.addLayout(btn_layout)
         
-        self.save_btn = QPushButton("💾 파일로 저장")
-        self.save_btn.setEnabled(False)
-        self.save_btn.clicked.connect(self.save_audio)
-        player_layout.addWidget(self.save_btn)
-        
         right_layout.addWidget(player_group)
         right_layout.addStretch()
         
@@ -488,7 +524,10 @@ class MainWindow(QMainWindow):
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         footer.setStyleSheet("color: #999; font-size: 12px;")
         layout.addWidget(footer)
-    
+
+        # 저장된 엔진에 맞춰 초기 UI 상태 적용
+        self._apply_engine_ui()
+
     # ── 음성 설정 헬퍼 메서드 ──
 
     def _preset_btn_style(self):
@@ -505,15 +544,74 @@ class MainWindow(QMainWindow):
         layout.setSpacing(4)
         return layout
 
+    def _current_engine(self):
+        return self.engine_combo.currentData() if hasattr(self, "engine_combo") else "qwen"
+
+    def _rebuild_voice_combo(self):
+        """현재 엔진에 맞는 음성 목록으로 콤보박스를 다시 채운다"""
+        self.voice_combo.blockSignals(True)
+        self.voice_combo.clear()
+
+        if self._current_engine() == "kokoro":
+            for voice_id, lang_code, language, description in KOKORO_VOICE_OPTIONS:
+                self.voice_combo.addItem(f"{voice_id} ({language})", voice_id)
+            self.voice_combo.setCurrentIndex(0)  # af_heart 기본값
+        else:
+            # Qwen: built-in 음성 + 커스텀 클론 음성
+            for voice, language, description in VOICE_OPTIONS:
+                self.voice_combo.addItem(f"{voice} ({language})", voice)
+            if CUSTOM_VOICE_PRESETS:
+                self.voice_combo.insertSeparator(self.voice_combo.count())
+                for voice_name, info in CUSTOM_VOICE_PRESETS.items():
+                    label = f"[Clone] {voice_name} ({info['language']})"
+                    self.voice_combo.addItem(label, voice_name)
+            self.voice_combo.setCurrentIndex(8)  # Sohee 기본값
+
+        self.voice_combo.blockSignals(False)
+        self._on_voice_changed()
+
     def _on_voice_changed(self):
-        idx = self.voice_combo.currentIndex()
+        if not hasattr(self, "voice_desc_label"):
+            return  # 아직 UI 초기화 중
         voice_name = self.voice_combo.currentData()
-        if voice_name and voice_name in CUSTOM_VOICE_PRESETS:
+        desc = None
+        if voice_name and voice_name in KOKORO_VOICES:
+            desc = KOKORO_VOICES[voice_name]["description"]
+        elif voice_name and voice_name in CUSTOM_VOICE_PRESETS:
             desc = CUSTOM_VOICE_PRESETS[voice_name]["description"]
+        else:
+            for v, _lang, d in VOICE_OPTIONS:
+                if v == voice_name:
+                    desc = d
+                    break
+        if desc:
             self.voice_desc_label.setText(f'  "{desc}"')
-        elif 0 <= idx < len(VOICE_OPTIONS):
-            _, _, desc = VOICE_OPTIONS[idx]
-            self.voice_desc_label.setText(f'  "{desc}"')
+
+    def on_engine_changed(self, index):
+        """TTS 엔진 변경 시: 설정 저장 + 음성 목록/UI 갱신"""
+        engine = self.engine_combo.currentData()
+        self.config["tts_engine"] = engine
+        save_config(self.config)
+        self._rebuild_voice_combo()
+        self._apply_engine_ui()
+
+    def _apply_engine_ui(self):
+        """엔진에 따라 관련 UI 요소 활성/비활성 및 안내문 갱신"""
+        is_kokoro = self._current_engine() == "kokoro"
+        # 모델 크기(1.7B/0.6B)는 Qwen 전용
+        self.model_size_combo.setEnabled(not is_kokoro)
+        self.model_size_label.setEnabled(not is_kokoro)
+        # 스타일 프리셋/프롬프트는 Qwen 전용 (Kokoro는 미지원)
+        if hasattr(self, "preset_tabs"):
+            self.preset_tabs.setEnabled(not is_kokoro)
+        if hasattr(self, "instruct_edit"):
+            self.instruct_edit.setEnabled(not is_kokoro)
+        if is_kokoro:
+            self.model_desc.setText("• Kokoro-82M: 영어 전용 경량 모델 (매우 빠름)\n"
+                                    "• 스타일 프롬프트/모델 크기 설정은 적용되지 않습니다")
+        else:
+            self.model_desc.setText("• 1.7B: 높은 품질, VRAM ~4GB 이상 권장\n"
+                                    "• 0.6B: 빠른 속도, 낮은 VRAM 사용")
 
     def _uncheck_all_presets(self):
         """모든 프리셋 버튼의 체크 해제"""
@@ -548,6 +646,12 @@ class MainWindow(QMainWindow):
         self._uncheck_all_presets()
         self.instruct_edit.setText(prompt)
 
+    def on_model_size_changed(self, index):
+        """모델 크기 변경 시 설정 저장"""
+        model_size = self.model_size_combo.currentData()
+        self.config["model_size"] = model_size
+        save_config(self.config)
+
     def on_language_changed(self, index):
         """언어 선택 변경 시 설정 저장"""
         lang_code = self.lang_combo.currentData()
@@ -576,11 +680,11 @@ class MainWindow(QMainWindow):
                 lang_name = get_language_name(detected_lang)
                 self.lang_info.setText(f"🌍 감지된 언어: {lang_name} ({int(confidence*100)}%)")
                 
-                # 목소리 언어 확인
+                # 목소리 언어 확인 (Kokoro 엔진은 추천 음성이 Qwen용이므로 건너뜀)
                 current_voice = self.voice_combo.currentData()
                 is_mismatch, _, _ = check_language_mismatch(text, current_voice)
-                
-                if is_mismatch:
+
+                if is_mismatch and self._current_engine() == "qwen":
                     recommended = get_recommended_voices(detected_lang)
                     if recommended:
                         # 사용자에게 확인
@@ -664,7 +768,7 @@ class MainWindow(QMainWindow):
             self.output_dir = self.config["output_directory"]
             self.device = get_device(self.config)
             os.makedirs(self.output_dir, exist_ok=True)
-            self.folder_label.setText(f"📁 저장: {self.output_dir}")
+            self.folder_label.setText(f"📁 저장: {os.path.normpath(self.output_dir)}")
             self.device_label.setText(f"⚙️ 디바이스: {self.device.upper()}")
             QMessageBox.information(self, "설정 저장", "설정이 저장되었습니다.")
     
@@ -723,6 +827,7 @@ class MainWindow(QMainWindow):
         
         voice = self.voice_combo.currentData()
         instruct_text = self.instruct_edit.toPlainText().strip()
+        engine = self._current_engine()
 
         # 커스텀 음성 여부 판단
         is_custom = voice in CUSTOM_VOICE_PRESETS
@@ -732,10 +837,16 @@ class MainWindow(QMainWindow):
             ref_audio_path = CUSTOM_VOICE_PRESETS[voice]["ref_audio_path"]
             ref_text = CUSTOM_VOICE_PRESETS[voice]["ref_text"]
 
+        model_size = self.model_size_combo.currentData()
+        # Kokoro 음성의 언어 코드 (예: af_heart -> 'a')
+        kokoro_lang_code = KOKORO_VOICES.get(voice, {}).get("lang_code", "a")
+
         self.tts_worker = TTSWorker(
             text=text, output_path=self.output_file,
             voice=voice, instruct_text=instruct_text, device=self.device,
             is_custom_voice=is_custom, ref_audio_path=ref_audio_path, ref_text=ref_text,
+            model_size=model_size,
+            tts_engine=engine, kokoro_lang_code=kokoro_lang_code,
         )
         self.tts_worker.progress.connect(self.update_progress)
         self.tts_worker.status.connect(self.update_status)
@@ -763,7 +874,6 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self.play_btn.setEnabled(True)
         self.stop_btn.setEnabled(True)
-        self.save_btn.setEnabled(True)
         
         self.player.setPlaybackRate(self.playback_speed)
         
@@ -808,7 +918,6 @@ class MainWindow(QMainWindow):
         self.stop_convert_btn.setEnabled(False)
         self.progress_bar.setVisible(False)
         self.play_btn.setEnabled(True)
-        self.save_btn.setEnabled(True)
         
         self.output_file = partial_path
         self.player.setPlaybackRate(self.playback_speed)
@@ -843,21 +952,31 @@ class MainWindow(QMainWindow):
             pass
         self.play_btn.clicked.connect(self.play_audio)
     
-    def save_audio(self):
-        if not self.output_file:
-            return
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "오디오 파일 저장", os.path.basename(self.output_file), "Audio Files (*.wav)"
-        )
-        if save_path:
-            import shutil
-            shutil.copy(self.output_file, save_path)
-            QMessageBox.information(self, "저장 완료", f"파일 저장됨:\n{save_path}")
-    
     def closeEvent(self, event):
         if self.tts_worker and self.tts_worker.isRunning():
-            self.tts_worker.terminate()
-            self.tts_worker.wait()
+            reply = QMessageBox.question(
+                self, "종료 확인",
+                "음성 변환이 진행 중입니다.\n\n"
+                "• [Yes] 현재 청크까지 저장 후 종료\n"
+                "• [No] 즉시 종료 (진행 중인 데이터 손실)\n"
+                "• [Cancel] 종료 취소",
+                QMessageBox.StandardButton.Yes |
+                QMessageBox.StandardButton.No |
+                QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Cancel:
+                event.ignore()
+                return
+            elif reply == QMessageBox.StandardButton.Yes:
+                # 우아한 종료: 현재 청크 완료 후 저장
+                self.tts_worker.stop()
+                self.status_label.setText("종료 중... 현재 청크 저장 대기")
+                self.tts_worker.wait(30000)  # 최대 30초 대기
+            else:
+                # 즉시 종료
+                self.tts_worker.terminate()
+                self.tts_worker.wait(5000)
         self.player.stop()
         event.accept()
 

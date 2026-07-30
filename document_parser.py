@@ -185,6 +185,30 @@ VOICE_OPTIONS = [
     ("Sohee", "Korean", "풍부한 감정의 따뜻한 한국 여성 목소리")
 ]
 
+# Kokoro-82M 음성 목록 (voice_id, lang_code, 표시 언어, 설명)
+# lang_code: 'a' = American English, 'b' = British English
+# (Kokoro는 한국어를 지원하지 않으며, 영어 음성이 가장 안정적입니다)
+KOKORO_VOICE_OPTIONS = [
+    ("af_heart",    "a", "English (US)", "따뜻하고 표현력이 풍부한 미국 여성 (최고 품질)"),
+    ("af_bella",    "a", "English (US)", "생기 있고 매력적인 미국 여성"),
+    ("af_nicole",   "a", "English (US)", "부드럽고 친밀한 미국 여성 (ASMR/헤드폰)"),
+    ("af_aoede",    "a", "English (US)", "맑고 균형 잡힌 미국 여성"),
+    ("af_kore",     "a", "English (US)", "차분하고 안정된 미국 여성"),
+    ("am_michael",  "a", "English (US)", "신뢰감 있고 안정적인 미국 남성"),
+    ("am_fenrir",   "a", "English (US)", "깊고 힘 있는 미국 남성"),
+    ("am_puck",     "a", "English (US)", "밝고 경쾌한 미국 남성"),
+    ("bf_emma",     "b", "English (UK)", "우아하고 차분한 영국 여성"),
+    ("bf_isabella", "b", "English (UK)", "세련된 영국 여성"),
+    ("bm_george",   "b", "English (UK)", "중후한 영국 남성"),
+    ("bm_fable",    "b", "English (UK)", "부드러운 이야기꾼 영국 남성"),
+]
+
+# voice_id -> {lang_code, language, description}
+KOKORO_VOICES = {
+    vid: {"lang_code": lc, "language": lang, "description": desc}
+    for vid, lc, lang, desc in KOKORO_VOICE_OPTIONS
+}
+
 # 커스텀 음성 프리셋 (voices/ 디렉토리에서 로드)
 CUSTOM_VOICE_PRESETS = {}
 

@@ -16,6 +16,14 @@ try:
 except ImportError:
     SOUNDFILE_AVAILABLE = False
 
+# flash-attn is optional (hard to build on Windows). Fall back to PyTorch's
+# built-in SDPA (memory-efficient attention) when it isn't installed.
+try:
+    import flash_attn  # noqa: F401
+    ATTN_IMPLEMENTATION = "flash_attention_2"
+except ImportError:
+    ATTN_IMPLEMENTATION = "sdpa"
+
 
 class TTSWorker(QThread):
     """백그라운드 TTS 처리 스레드 (ETA 계산 포함)"""
@@ -27,7 +35,8 @@ class TTSWorker(QThread):
     stopped = pyqtSignal(str)       # 중지 시그널 (중간 저장 파일 경로)
 
     def __init__(self, text, output_path, voice="Sohee", instruct_text="", device="cpu",
-                 is_custom_voice=False, ref_audio_path=None, ref_text=None):
+                 is_custom_voice=False, ref_audio_path=None, ref_text=None, model_size="1.7B",
+                 tts_engine="qwen", kokoro_lang_code="a"):
         super().__init__()
         self.text = text
         self.output_path = output_path
@@ -37,16 +46,21 @@ class TTSWorker(QThread):
         self.is_custom_voice = is_custom_voice
         self.ref_audio_path = ref_audio_path
         self.ref_text = ref_text
+        self.model_size = model_size
+        self.tts_engine = tts_engine          # "qwen" 또는 "kokoro"
+        self.kokoro_lang_code = kokoro_lang_code
+        self.kokoro_pipeline = None
         self.model = None
         self.chunk_times = []  # 각 청크 처리 시간 기록
         self._is_running = True  # 중지 플래그
 
     def run(self):
         try:
-            self.status.emit(f"Qwen3-TTS 모델 로딩 중... (디바이스: {self.device})")
+            engine_name = "Kokoro-82M" if self.tts_engine == "kokoro" else "Qwen3-TTS"
+            self.status.emit(f"{engine_name} 모델 로딩 중... (디바이스: {self.device})")
             start_time = time.time()
 
-            if not QWEN_AVAILABLE:
+            if self.tts_engine == "qwen" and not QWEN_AVAILABLE:
                 # Mock mode
                 for i in range(100):
                     time.sleep(0.05)
@@ -70,37 +84,94 @@ class TTSWorker(QThread):
             import torch
             self.progress.emit(5)
 
-            if self.is_custom_voice:
-                # Voice Clone: Base 모델 사용
-                self.status.emit(f"🔄 Qwen3-TTS Base 모델 로딩 중... (보이스 클론 모드)")
-                self.model = Qwen3TTSModel.from_pretrained(
-                    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-                    device_map=self.device,
-                    dtype=torch.float16,
-                    attn_implementation="sdpa",
-                )
-                self.progress.emit(8)
-
-                # 참조 오디오로 voice clone prompt 사전 생성 (재사용)
-                self.status.emit("🎤 참조 음성 분석 중...")
-                self.voice_clone_prompt = self.model.create_voice_clone_prompt(
-                    ref_audio=self.ref_audio_path,
-                    ref_text=self.ref_text,
-                    x_vector_only_mode=False,  # ICL 모드 (더 높은 품질)
-                )
+            if self.tts_engine == "kokoro":
+                self._load_kokoro()
             else:
-                # Built-in: CustomVoice 모델 사용
-                self.status.emit(f"🔄 Qwen3-TTS 모델 다운로드/로딩 중... (최초 1회, 수 분 소요될 수 있습니다)")
-                self.model = Qwen3TTSModel.from_pretrained(
-                    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-                    device_map=self.device,
-                    dtype=torch.float16,
-                    attn_implementation="sdpa",
-                )
+                self._load_qwen(torch)
 
             self.progress.emit(10)  # 모델 로딩 완료
 
+            # torch.compile로 추론 최적화 (첫 청크만 약간 느리고 이후 빨라짐)
+            try:
+                if hasattr(self.model, 'llm') and hasattr(torch, 'compile'):
+                    self.status.emit("모델 최적화 중 (torch.compile)...")
+                    self.model.llm = torch.compile(self.model.llm, mode="reduce-overhead")
+            except Exception as e:
+                print(f"[warn] torch.compile 실패, 기본 모드로 진행: {e}")
+
             self.status.emit("음성 생성 중...")
+            self._run_generation(torch, start_time)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+    def _load_qwen(self, torch):
+        """Qwen3-TTS 모델 로드"""
+        # 모델 크기에 따른 모델 ID 결정
+        size = self.model_size  # "1.7B" 또는 "0.6B"
+        base_model_id = f"Qwen/Qwen3-TTS-12Hz-{size}-Base"
+        custom_model_id = f"Qwen/Qwen3-TTS-12Hz-{size}-CustomVoice"
+
+        # bfloat16: float16보다 수치 범위가 넓어 확률 언더플로우 방지
+        model_dtype = torch.bfloat16
+
+        if self.is_custom_voice:
+            # Voice Clone: Base 모델 사용
+            self.status.emit(f"🔄 Qwen3-TTS {size} Base 모델 로딩 중... (보이스 클론 모드)")
+            self.model = Qwen3TTSModel.from_pretrained(
+                base_model_id,
+                device_map=self.device,
+                dtype=model_dtype,
+                attn_implementation=ATTN_IMPLEMENTATION,
+            )
+            self.progress.emit(8)
+
+            # 참조 오디오로 voice clone prompt 사전 생성 (재사용)
+            self.status.emit("🎤 참조 음성 분석 중...")
+            self.voice_clone_prompt = self.model.create_voice_clone_prompt(
+                ref_audio=self.ref_audio_path,
+                ref_text=self.ref_text,
+                x_vector_only_mode=False,  # ICL 모드 (더 높은 품질)
+            )
+        else:
+            # Built-in: CustomVoice 모델 사용
+            self.status.emit(f"🔄 Qwen3-TTS {size} 모델 다운로드/로딩 중... (최초 1회, 수 분 소요될 수 있습니다)")
+            self.model = Qwen3TTSModel.from_pretrained(
+                custom_model_id,
+                device_map=self.device,
+                dtype=model_dtype,
+                attn_implementation=ATTN_IMPLEMENTATION,
+            )
+
+    def _load_kokoro(self):
+        """Kokoro-82M 파이프라인 로드 (최초 1회 모델 자동 다운로드)"""
+        from kokoro import KPipeline
+        self.status.emit("🔄 Kokoro-82M 모델 다운로드/로딩 중... (최초 1회 ~330MB)")
+        device = self.device if self.device in ("cuda", "cpu") else None
+        self.kokoro_pipeline = KPipeline(
+            lang_code=self.kokoro_lang_code,
+            repo_id="hexgrad/Kokoro-82M",
+            device=device,
+        )
+
+    def _synthesize_kokoro(self, chunk):
+        """Kokoro로 한 청크를 합성 → ([audio_np], sample_rate) 반환"""
+        parts = []
+        for _, _, audio in self.kokoro_pipeline(chunk, voice=self.voice, speed=1):
+            if hasattr(audio, 'detach'):
+                audio = audio.detach().cpu().numpy()
+            elif hasattr(audio, 'numpy'):
+                audio = audio.numpy()
+            parts.append(np.asarray(audio, dtype=np.float32))
+        if not parts:
+            return None, 24000
+        return [np.concatenate(parts)], 24000
+
+    def _run_generation(self, torch, start_time):
+        """청크 단위로 음성 생성 후 파일로 저장 (Qwen/Kokoro 공통)"""
+        try:
             chunks = self._chunk_text(self.text)
             total_chunks = len(chunks)
 
@@ -133,29 +204,45 @@ class TTSWorker(QThread):
                 self.progress.emit(progress)
                 self.status.emit(f"처리 중... {i+1}/{total_chunks} 청크 ({progress}%) | 저장된 파일: {file_idx}개")
 
-                # TTS 생성
+                # TTS 생성 (CUDA 에러 시 최대 3회 재시도)
                 import torch
-                with torch.no_grad():
-                    if self.is_custom_voice:
-                        # Voice Clone: Base 모델 + ICL 프롬프트
-                        from document_parser import CUSTOM_VOICE_PRESETS
-                        voice_info = CUSTOM_VOICE_PRESETS.get(self.voice, {})
-                        language = voice_info.get("language", "Korean")
-                        wavs, sr = self.model.generate_voice_clone(
-                            text=chunk,
-                            language=language,
-                            voice_clone_prompt=self.voice_clone_prompt,
-                            max_new_tokens=2048,
-                        )
-                    else:
-                        # Built-in: CustomVoice 모델
-                        wavs, sr = self.model.generate_custom_voice(
-                            text=chunk,
-                            language="Korean" if self.voice == "Sohee" else "Auto",
-                            speaker=self.voice,
-                            instruct=self.instruct_text if self.instruct_text else None,
-                            max_new_tokens=2048,
-                        )
+                max_retries = 3
+                wavs, sr = None, None
+                for attempt in range(max_retries):
+                    try:
+                        with torch.no_grad():
+                            if self.tts_engine == "kokoro":
+                                wavs, sr = self._synthesize_kokoro(chunk)
+                            elif self.is_custom_voice:
+                                from document_parser import CUSTOM_VOICE_PRESETS
+                                voice_info = CUSTOM_VOICE_PRESETS.get(self.voice, {})
+                                language = voice_info.get("language", "Korean")
+                                wavs, sr = self.model.generate_voice_clone(
+                                    text=chunk,
+                                    language=language,
+                                    voice_clone_prompt=self.voice_clone_prompt,
+                                    max_new_tokens=2048,
+                                )
+                            else:
+                                wavs, sr = self.model.generate_custom_voice(
+                                    text=chunk,
+                                    language="Korean" if self.voice == "Sohee" else "Auto",
+                                    speaker=self.voice,
+                                    instruct=self.instruct_text if self.instruct_text else None,
+                                    max_new_tokens=2048,
+                                )
+                        break  # 성공 시 루프 탈출
+                    except RuntimeError as e:
+                        if "CUDA" in str(e) and attempt < max_retries - 1:
+                            self.status.emit(f"⚠️ CUDA 에러 발생, 재시도 중... ({attempt+2}/{max_retries})")
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                            import gc; gc.collect()
+                            time.sleep(1)
+                        else:
+                            raise
+                if wavs is None:
+                    continue  # 생성 실패 시 다음 청크로
 
                 # 오디오 데이터를 CPU numpy로 즉시 이동 (GPU 메모리 해제)
                 wav_data = wavs[0]
@@ -226,9 +313,9 @@ class TTSWorker(QThread):
                     file_idx += 1
                     partial_path = f"{base_path}_{file_idx:02d}_partial.wav"
                     sf.write(partial_path, combined, sample_rate)
-                    saved_files.append(partial_path)
-                    mp3_files = self._convert_all_to_mp3(saved_files)
-                    self.stopped.emit(mp3_files[0])
+                    mp3_path = self._convert_wav_to_mp3(partial_path)
+                    saved_files.append(mp3_path)
+                    self.stopped.emit(saved_files[0])
                     return
                 else:
                     # 정상 완료 → 마지막 세그먼트 저장
@@ -245,15 +332,15 @@ class TTSWorker(QThread):
                         file_idx += 1
                         segment_path = f"{base_path}_{file_idx:02d}.wav"
                         sf.write(segment_path, combined, sample_rate)
-                        saved_files.append(segment_path)
+                        mp3_path = self._convert_wav_to_mp3(segment_path)
+                        saved_files.append(mp3_path)
                 del combined
 
             if saved_files:
                 total_time = time.time() - start_time
-                mp3_files = self._convert_all_to_mp3(saved_files)
-                self.eta.emit(f"총 소요 시간: {self._format_time(total_time)} | {len(mp3_files)}개 파일 생성됨")
+                self.eta.emit(f"총 소요 시간: {self._format_time(total_time)} | {len(saved_files)}개 파일 생성됨")
                 self.progress.emit(100)
-                self.finished_signal.emit(mp3_files[0])
+                self.finished_signal.emit(saved_files[0])
             else:
                 self.error.emit("변환할 텍스트가 없습니다.")
 
@@ -313,7 +400,7 @@ class TTSWorker(QThread):
             chunks.append(current)
         return chunks
 
-    def _chunk_text(self, text, max_chars=200):
+    def _chunk_text(self, text, max_chars=500):
         """텍스트를 청크로 분할 (문맥 보존, 문장 단위)"""
         # 텍스트 정규화 적용
         text = self._normalize_text(text)
@@ -352,6 +439,9 @@ class TTSWorker(QThread):
     def _convert_wav_to_mp3(self, wav_path):
         """WAV → MP3 변환 후 WAV 삭제. 성공 시 mp3 경로 반환."""
         import os
+        # 이미 MP3인 경우 변환 건너뜀
+        if not wav_path.lower().endswith('.wav'):
+            return wav_path
         try:
             import av as _av
         except ImportError:
