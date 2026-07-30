@@ -30,6 +30,12 @@ TTS_ENGINE_OPTIONS = [
     ("kokoro", "Kokoro-82M (영어 전용, 경량·고속, 스타일 프롬프트 미지원)"),
 ]
 
+# 출력 형식 (오디오만 / 오디오 + 자막)
+OUTPUT_FORMAT_OPTIONS = [
+    ("audio", "오디오만 (MP3)"),
+    ("audio_srt", "오디오 + 자막(.srt)"),
+]
+
 def get_default_config():
     """기본 설정 반환"""
     return {
@@ -41,6 +47,7 @@ def get_default_config():
         "custom_device": None,  # auto가 아닐 경우 사용
         "model_size": "1.7B",  # 1.7B 또는 0.6B
         "tts_engine": "qwen",  # qwen 또는 kokoro
+        "output_format": "audio",  # audio 또는 audio_srt
     }
 
 def load_config():

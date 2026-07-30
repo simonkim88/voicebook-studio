@@ -21,11 +21,18 @@
    - 실시간 남은 시간 계산 및 표시
    - 청크별 처리 시간 기반 정밀 예측
 
-3. **모듈화된 코드 구조**
+3. **자막(.srt) 동시 출력 — Simon Reader 오디오-텍스트 매칭용**
+   - "출력 형식"에서 `오디오만` / `오디오 + 자막(.srt)` 선택
+   - 각 MP3와 **같은 이름**의 `.srt`를 함께 생성 (예: `book_01.mp3` ↔ `book_01.srt`)
+   - Simon Reader의 "매칭 파일 가져오기"에 그대로 업로드하면 짝이 맞춰짐
+   - 자세한 내용은 아래 [자막(.srt) 출력](#-자막srt-출력--simon-reader-연동) 참고
+
+4. **모듈화된 코드 구조**
    - `voicebook_studio_v1.0.py` - 메인 애플리케이션
    - `config_manager.py` - 설정 관리
    - `document_parser.py` - 문서 파싱
    - `tts_worker.py` - TTS 백그라운드 작업
+   - `srt_writer.py` - 자막(.srt) 생성
    - `ui_components.py` - UI 위젯
    - `language_detector.py` - 언어 감지
    - `content_filter.py` - 본문 필터
@@ -40,6 +47,7 @@ Qwen3-TTSApp/
 ├── config_manager.py         # 설정 관리 모듈
 ├── document_parser.py        # 문서 파싱 모듈
 ├── tts_worker.py            # TTS 작업 모듈
+├── srt_writer.py            # 자막(.srt) 생성 모듈
 ├── ui_components.py         # UI 위젯 모듈
 ├── language_detector.py     # 언어 감지 모듈
 ├── content_filter.py        # 본문 필터 모듈
@@ -121,6 +129,61 @@ python voicebook_studio_v1.0.py
 
 ---
 
+## 📝 자막(.srt) 출력 — Simon Reader 연동
+
+"출력 형식"에서 **오디오 + 자막(.srt)** 을 선택하면, 오디오와 함께 문장 단위로
+시간이 매겨진 `.srt` 파일이 생성됩니다.
+
+### 파일 짝짓기 규칙 (중요)
+
+Simon Reader는 **파일명 stem**으로 오디오와 자막을 짝짓습니다. 따라서 자막은
+항상 오디오와 같은 이름·같은 폴더에 생성됩니다.
+
+```
+book_audiobook_01.mp3  ↔  book_audiobook_01.srt
+book_audiobook_02.mp3  ↔  book_audiobook_02.srt
+```
+
+10분 단위로 오디오가 분할되면 자막도 파일별로 나뉘며, **각 자막의 시간은 해당
+오디오 파일의 0초 기준**입니다. 파일 경계에 걸친 문장은 양쪽에 잘려 들어갑니다.
+
+### 사용법
+
+1. 이 앱에서 `오디오 + 자막(.srt)`으로 변환
+2. Simon Reader에 원본 문서(EPUB/PDF/DOCX/TXT)를 책으로 등록
+3. 같은 책에 생성된 MP3를 오디오로 업로드
+4. "매칭 파일 가져오기"로 `.srt`를 업로드 → 책 본문과 자동 정렬
+
+### 타임스탬프 정확도
+
+| 엔진 | 방식 |
+|------|------|
+| Kokoro-82M | 엔진이 준 구간 경계를 그대로 사용 + 구간 내부는 문장 단위로 세분화 |
+| Qwen3-TTS | 문장별 글자 수 비례로 배분한 뒤, 경계를 실제 무음 구간으로 스냅 |
+
+두 경우 모두 문장 사이의 묵음을 찾아 경계를 보정하므로, 문장 단위 하이라이트에
+충분한 정확도가 나옵니다.
+
+### 출력 형식 사양
+
+Simon Reader의 alignment 임포터가 요구하는 형식을 그대로 따릅니다.
+
+```
+1
+00:00:00,000 --> 00:00:02,850
+The morning light came slowly through the window.
+
+2
+00:00:02,850 --> 00:00:06,450
+She opened the old book and began to read aloud.
+```
+
+- 인코딩 UTF-8, 줄바꿈 LF, 블록 구분은 빈 줄
+- 타임스탬프 구분자는 `" --> "` (앞뒤 공백 각 1칸)
+- 자막 텍스트는 항상 한 줄 (내부 개행 없음), `end > start` 보장
+
+---
+
 ## 🖥️ 지원 플랫폼
 
 | 플랫폼 | CPU | GPU | 테스트 상태 |
@@ -156,6 +219,11 @@ ModuleNotFoundError
 ---
 
 ## 📝 버전 기록
+
+- **v2.5** - 자막(.srt) 동시 출력
+  - 출력 형식 선택 (오디오만 / 오디오 + 자막)
+  - Simon Reader 호환 .srt 생성 (문장 단위, 무음 기반 경계 보정)
+  - 파일 분할 시 자막도 파일별로 분할 (오디오와 파일명 stem 일치)
 
 - **v1.0** - VoiceBook Studio 출시
   - 크로스 플랫폼 지원 (Mac/Windows/Linux)

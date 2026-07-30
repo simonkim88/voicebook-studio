@@ -8,7 +8,7 @@ import glob
 # 모듈 임포트
 from config_manager import (
     load_config, save_config, get_device, DEFAULT_OUTPUT_DIR,
-    MODEL_SIZE_OPTIONS, TTS_ENGINE_OPTIONS
+    MODEL_SIZE_OPTIONS, TTS_ENGINE_OPTIONS, OUTPUT_FORMAT_OPTIONS
 )
 from document_parser import (
     DocumentParser, VOICE_OPTIONS, load_custom_voices, CUSTOM_VOICE_PRESETS,
@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QProgressBar, QComboBox, QSlider, QTextEdit,
     QMessageBox, QGroupBox, QSplitter, QTabWidget, QMenuBar, QDialog,
-    QCheckBox, QGridLayout, QLineEdit
+    QCheckBox, QGridLayout, QLineEdit, QRadioButton, QButtonGroup
 )
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QFont, QAction
@@ -159,7 +159,40 @@ class MainWindow(QMainWindow):
         self.output_name_input.setPlaceholderText("파일명을 입력하세요 (비워두면 원본 파일명 사용)")
         output_name_layout.addWidget(self.output_name_input)
         layout.addLayout(output_name_layout)
-        
+
+        # 출력 형식 (오디오만 / 오디오 + 자막)
+        output_format_group = QGroupBox("출력 형식")
+        output_format_layout = QVBoxLayout(output_format_group)
+
+        radio_row = QHBoxLayout()
+        self.output_format_buttons = QButtonGroup(self)
+        saved_format = self.config.get("output_format", "audio")
+        for value, label in OUTPUT_FORMAT_OPTIONS:
+            radio = QRadioButton(label)
+            radio.setProperty("format_value", value)
+            if value == saved_format:
+                radio.setChecked(True)
+            self.output_format_buttons.addButton(radio)
+            radio_row.addWidget(radio)
+        radio_row.addStretch()
+        output_format_layout.addLayout(radio_row)
+
+        # 저장된 값이 유효하지 않은 경우 첫 번째 옵션으로 폴백
+        if self.output_format_buttons.checkedButton() is None:
+            self.output_format_buttons.buttons()[0].setChecked(True)
+
+        self.output_format_buttons.buttonClicked.connect(self.on_output_format_changed)
+
+        output_format_desc = QLabel(
+            "• 오디오만: MP3 파일만 생성\n"
+            "• 오디오 + 자막: 각 MP3와 같은 이름의 .srt 자막을 함께 생성\n"
+            "  (Simon Reader에 그대로 올려 오디오-텍스트 매칭에 사용)"
+        )
+        output_format_desc.setStyleSheet("color: #666; font-size: 11px;")
+        output_format_layout.addWidget(output_format_desc)
+
+        layout.addWidget(output_format_group)
+
         # 스플리터
         splitter = QSplitter(Qt.Orientation.Horizontal)
         
@@ -652,6 +685,18 @@ class MainWindow(QMainWindow):
         self.config["model_size"] = model_size
         save_config(self.config)
 
+    def _current_output_format(self):
+        """현재 선택된 출력 형식 ('audio' 또는 'audio_srt')"""
+        button = self.output_format_buttons.checkedButton()
+        if button is None:
+            return "audio"
+        return button.property("format_value") or "audio"
+
+    def on_output_format_changed(self, button):
+        """출력 형식 변경 시 설정 저장"""
+        self.config["output_format"] = self._current_output_format()
+        save_config(self.config)
+
     def on_language_changed(self, index):
         """언어 선택 변경 시 설정 저장"""
         lang_code = self.lang_combo.currentData()
@@ -797,7 +842,8 @@ class MainWindow(QMainWindow):
 
         # 이전 세그먼트 파일 → temp 폴더로 이동 (복구 가능)
         base_path = self.output_file.replace('.wav', '')
-        old_segments = glob.glob(f"{base_path}_*.wav") + glob.glob(f"{base_path}_*.mp3")
+        old_segments = (glob.glob(f"{base_path}_*.wav") + glob.glob(f"{base_path}_*.mp3")
+                        + glob.glob(f"{base_path}_*.srt"))
         if old_segments:
             import shutil
             from datetime import datetime
@@ -809,8 +855,8 @@ class MainWindow(QMainWindow):
                     shutil.move(f, os.path.join(temp_dir, os.path.basename(f)))
                 except OSError:
                     pass
-            # 메인 파일도 이동 (wav/mp3 모두)
-            for main_ext in ['.wav', '.mp3']:
+            # 메인 파일도 이동 (wav/mp3/srt 모두)
+            for main_ext in ['.wav', '.mp3', '.srt']:
                 main_file = base_path + main_ext
                 if os.path.exists(main_file):
                     try:
@@ -847,6 +893,7 @@ class MainWindow(QMainWindow):
             is_custom_voice=is_custom, ref_audio_path=ref_audio_path, ref_text=ref_text,
             model_size=model_size,
             tts_engine=engine, kokoro_lang_code=kokoro_lang_code,
+            generate_srt=(self._current_output_format() == "audio_srt"),
         )
         self.tts_worker.progress.connect(self.update_progress)
         self.tts_worker.status.connect(self.update_status)
@@ -890,7 +937,12 @@ class MainWindow(QMainWindow):
                 message += f"• ... 외 {len(segment_files) - 5}개 파일\n"
         else:
             message = f"오디오북 생성 완료!\n\n저장 위치: {output_path}"
-        
+
+        srt_files = getattr(self.tts_worker, "srt_files", []) if self.tts_worker else []
+        if srt_files:
+            message += (f"\n📝 자막(.srt) {len(srt_files)}개도 함께 생성되었습니다.\n"
+                        f"오디오와 파일명이 같으므로 Simon Reader에 그대로 올리면 매칭됩니다.")
+
         QMessageBox.information(self, "완료", message)
     
     def conversion_error(self, error_message):
@@ -922,10 +974,14 @@ class MainWindow(QMainWindow):
         self.output_file = partial_path
         self.player.setPlaybackRate(self.playback_speed)
         
-        QMessageBox.information(self, "중지됨", 
+        srt_files = getattr(self.tts_worker, "srt_files", []) if self.tts_worker else []
+        srt_note = f"\n📝 자막(.srt) {len(srt_files)}개도 함께 저장되었습니다.\n" if srt_files else ""
+
+        QMessageBox.information(self, "중지됨",
             f"음성 변환이 중지되었습니다.\n\n"
             f"현재까지 진행된 내용이 저장되었습니다:\n"
-            f"{partial_path}\n\n"
+            f"{partial_path}\n"
+            f"{srt_note}\n"
             f"※ 파일명에 '_partial'이 포함되어 있습니다.")
     
     def play_audio(self):

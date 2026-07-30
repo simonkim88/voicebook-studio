@@ -5,3 +5,7 @@ __pycache__/
 .venv
 env/
 venv/
+
+# 생성된 오디오북 산출물 (오디오/자막/임시 파일)
+audiofiles/
+config.json

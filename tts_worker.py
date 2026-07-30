@@ -4,6 +4,8 @@ import time
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from srt_writer import SrtTimeline, write_srt
+
 try:
     from qwen_tts import Qwen3TTSModel
     QWEN_AVAILABLE = True
@@ -48,7 +50,7 @@ class TTSWorker(QThread):
 
     def __init__(self, text, output_path, voice="Sohee", instruct_text="", device="cpu",
                  is_custom_voice=False, ref_audio_path=None, ref_text=None, model_size="1.7B",
-                 tts_engine="qwen", kokoro_lang_code="a"):
+                 tts_engine="qwen", kokoro_lang_code="a", generate_srt=False):
         super().__init__()
         self.text = text
         self.output_path = output_path
@@ -65,6 +67,14 @@ class TTSWorker(QThread):
         self.model = None
         self.chunk_times = []  # 각 청크 처리 시간 기록
         self._is_running = True  # 중지 플래그
+        self.max_duration_sec = 600  # 파일 분할 단위 (10분)
+
+        # SRT 자막(오디오-텍스트 매칭) 출력
+        self.generate_srt = generate_srt
+        self.srt_files = []            # 생성된 .srt 경로 목록
+        self._timeline = SrtTimeline() if generate_srt else None
+        self._written_samples = 0      # 지금까지 파일로 저장한 전역 샘플 수
+        self._last_engine_segments = None  # 엔진이 문장 단위로 준 구간 (Kokoro)
 
     def run(self):
         try:
@@ -172,17 +182,60 @@ class TTSWorker(QThread):
         )
 
     def _synthesize_kokoro(self, chunk):
-        """Kokoro로 한 청크를 합성 → ([audio_np], sample_rate) 반환"""
+        """Kokoro로 한 청크를 합성 → ([audio_np], sample_rate) 반환
+
+        Kokoro는 청크를 내부적으로 문장 단위로 쪼개 (텍스트, 오디오) 쌍을 yield
+        하므로, SRT용으로 그 경계를 그대로 기록해 둔다 (시간 추정 불필요)."""
         parts = []
-        for _, _, audio in self.kokoro_pipeline(chunk, voice=self.voice, speed=1):
+        segments = []
+        for graphemes, _, audio in self.kokoro_pipeline(chunk, voice=self.voice, speed=1):
             if hasattr(audio, 'detach'):
                 audio = audio.detach().cpu().numpy()
             elif hasattr(audio, 'numpy'):
                 audio = audio.numpy()
-            parts.append(np.asarray(audio, dtype=np.float32))
+            audio = np.asarray(audio, dtype=np.float32)
+            parts.append(audio)
+            segments.append((graphemes if isinstance(graphemes, str) else chunk, audio))
         if not parts:
+            self._last_engine_segments = None
             return None, 24000
+        self._last_engine_segments = segments
         return [np.concatenate(parts)], 24000
+
+    def _track_cues(self, chunk, wav_data, sample_rate):
+        """이번 청크의 오디오를 자막 타임라인에 반영"""
+        if self._timeline is None:
+            self._last_engine_segments = None  # 자막을 안 만들어도 참조는 즉시 해제
+            return
+        try:
+            if self._last_engine_segments:
+                self._timeline.add_engine_segments(self._last_engine_segments, sample_rate)
+            else:
+                self._timeline.add_chunk(chunk, wav_data, sample_rate)
+        except Exception as e:
+            print(f"[warn] 자막 타임라인 기록 실패: {e}")
+        finally:
+            self._last_engine_segments = None
+
+    def _flush_audio(self, data, wav_path, sample_rate):
+        """오디오 세그먼트를 저장 → MP3 변환 → (옵션) 같은 이름의 .srt 저장.
+
+        오디오 파일 경로를 반환한다. Simon Reader는 파일명 stem으로 오디오와
+        자막을 짝짓기 때문에 .srt는 반드시 최종 오디오 파일과 같은 이름이어야 한다."""
+        import soundfile as sf
+        sf.write(wav_path, data, sample_rate)
+        audio_path = self._convert_wav_to_mp3(wav_path)
+
+        if self._timeline is not None:
+            start = self._written_samples
+            end = start + len(data)
+            cues = self._timeline.cues_for_range(start, end, sample_rate)
+            srt_path = write_srt(audio_path, cues)
+            if srt_path:
+                self.srt_files.append(srt_path)
+
+        self._written_samples += len(data)
+        return audio_path
 
     def _run_generation(self, torch, start_time):
         """청크 단위로 음성 생성 후 파일로 저장 (Qwen/Kokoro 공통)"""
@@ -194,7 +247,7 @@ class TTSWorker(QThread):
             import os
 
             # 10분 단위 즉시 저장 설정
-            max_duration_sec = 600  # 10분
+            max_duration_sec = self.max_duration_sec
             base_path = self.output_path.replace('.wav', '')
             sample_rate = None
             segment_audio = []       # 현재 세그먼트의 오디오 버퍼
@@ -280,6 +333,9 @@ class TTSWorker(QThread):
                     sample_rate = sr
                 max_samples = int(max_duration_sec * sample_rate)
 
+                # 자막 타임라인 기록 (버퍼에 넣기 직전 = 전역 샘플 순서 그대로)
+                self._track_cues(chunk, wav_data, sample_rate)
+
                 segment_audio.append(wav_data)
                 segment_samples += len(wav_data)
                 del wav_data
@@ -289,8 +345,7 @@ class TTSWorker(QThread):
                     combined = np.concatenate(segment_audio)
                     file_idx += 1
                     segment_path = f"{base_path}_{file_idx:02d}.wav"
-                    sf.write(segment_path, combined[:max_samples], sample_rate)
-                    mp3_path = self._convert_wav_to_mp3(segment_path)
+                    mp3_path = self._flush_audio(combined[:max_samples], segment_path, sample_rate)
                     saved_files.append(mp3_path)
                     self.status.emit(f"💾 파일 {file_idx} 저장 완료! 계속 처리 중... {i+1}/{total_chunks}")
 
@@ -319,16 +374,14 @@ class TTSWorker(QThread):
                 if was_stopped and file_idx == 0:
                     # 중지 + 파일 없음 → partial로 저장
                     partial_path = f"{base_path}_partial.wav"
-                    sf.write(partial_path, combined, sample_rate)
-                    mp3_path = self._convert_wav_to_mp3(partial_path)
+                    mp3_path = self._flush_audio(combined, partial_path, sample_rate)
                     self.stopped.emit(mp3_path)
                     return
                 elif was_stopped:
                     # 중지 + 이미 저장된 파일 있음 → 나머지를 partial로 저장
                     file_idx += 1
                     partial_path = f"{base_path}_{file_idx:02d}_partial.wav"
-                    sf.write(partial_path, combined, sample_rate)
-                    mp3_path = self._convert_wav_to_mp3(partial_path)
+                    mp3_path = self._flush_audio(combined, partial_path, sample_rate)
                     saved_files.append(mp3_path)
                     self.stopped.emit(saved_files[0])
                     return
@@ -336,18 +389,16 @@ class TTSWorker(QThread):
                     # 정상 완료 → 마지막 세그먼트 저장
                     if file_idx == 0:
                         # 전체가 10분 이하 → 단일 파일
-                        sf.write(self.output_path, combined, sample_rate)
                         total_time = time.time() - start_time
                         self.eta.emit(f"총 소요 시간: {self._format_time(total_time)}")
                         self.progress.emit(100)
-                        mp3_path = self._convert_wav_to_mp3(self.output_path)
+                        mp3_path = self._flush_audio(combined, self.output_path, sample_rate)
                         self.finished_signal.emit(mp3_path)
                         return
                     else:
                         file_idx += 1
                         segment_path = f"{base_path}_{file_idx:02d}.wav"
-                        sf.write(segment_path, combined, sample_rate)
-                        mp3_path = self._convert_wav_to_mp3(segment_path)
+                        mp3_path = self._flush_audio(combined, segment_path, sample_rate)
                         saved_files.append(mp3_path)
                 del combined
 
