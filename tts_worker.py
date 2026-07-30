@@ -16,13 +16,25 @@ try:
 except ImportError:
     SOUNDFILE_AVAILABLE = False
 
-# flash-attn is optional (hard to build on Windows). Fall back to PyTorch's
-# built-in SDPA (memory-efficient attention) when it isn't installed.
-try:
-    import flash_attn  # noqa: F401
-    ATTN_IMPLEMENTATION = "flash_attention_2"
-except ImportError:
-    ATTN_IMPLEMENTATION = "sdpa"
+# flash-attn is CUDA-only and hard to build on Windows; it does not exist on
+# macOS (MPS)/CPU at all. Choose the attention backend by device so that
+# Windows-without-flash-attn, macOS (Apple Silicon), and CPU all fall back to
+# PyTorch's built-in SDPA instead of erroring on flash_attention_2.
+def _has_flash_attn():
+    try:
+        import flash_attn  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def get_attn_implementation(device):
+    """디바이스에 맞는 attention 구현 반환.
+    flash_attention_2는 CUDA + flash-attn 설치 시에만 사용. 그 외(macOS MPS/CPU,
+    flash-attn 미설치)는 sdpa로 폴백."""
+    if device == "cuda" and _has_flash_attn():
+        return "flash_attention_2"
+    return "sdpa"
 
 
 class TTSWorker(QThread):
@@ -117,6 +129,9 @@ class TTSWorker(QThread):
         # bfloat16: float16보다 수치 범위가 넓어 확률 언더플로우 방지
         model_dtype = torch.bfloat16
 
+        # 디바이스에 맞는 attention 백엔드 (CUDA+flash-attn만 flash_attention_2, 그 외 sdpa)
+        attn_impl = get_attn_implementation(self.device)
+
         if self.is_custom_voice:
             # Voice Clone: Base 모델 사용
             self.status.emit(f"🔄 Qwen3-TTS {size} Base 모델 로딩 중... (보이스 클론 모드)")
@@ -124,7 +139,7 @@ class TTSWorker(QThread):
                 base_model_id,
                 device_map=self.device,
                 dtype=model_dtype,
-                attn_implementation=ATTN_IMPLEMENTATION,
+                attn_implementation=attn_impl,
             )
             self.progress.emit(8)
 
@@ -142,7 +157,7 @@ class TTSWorker(QThread):
                 custom_model_id,
                 device_map=self.device,
                 dtype=model_dtype,
-                attn_implementation=ATTN_IMPLEMENTATION,
+                attn_implementation=attn_impl,
             )
 
     def _load_kokoro(self):
