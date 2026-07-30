@@ -50,7 +50,7 @@ class TTSWorker(QThread):
 
     def __init__(self, text, output_path, voice="Sohee", instruct_text="", device="cpu",
                  is_custom_voice=False, ref_audio_path=None, ref_text=None, model_size="1.7B",
-                 tts_engine="qwen", kokoro_lang_code="a", generate_srt=False):
+                 tts_engine="qwen", kokoro_lang_code="a", srt_mode="none"):
         super().__init__()
         self.text = text
         self.output_path = output_path
@@ -68,13 +68,18 @@ class TTSWorker(QThread):
         self.chunk_times = []  # 각 청크 처리 시간 기록
         self._is_running = True  # 중지 플래그
         self.max_duration_sec = 600  # 파일 분할 단위 (10분)
+        # False면 분할 없이 오디오 1개로 저장 (자막 매칭 정확도가 가장 높음).
+        # 전체를 메모리에 쌓지 않고 디스크로 스트리밍 저장한다.
+        self.split_audio = True
 
         # SRT 자막(오디오-텍스트 매칭) 출력
-        self.generate_srt = generate_srt
+        # "none": 만들지 않음 / "per_file": 오디오 파일마다 1개 / "merged": 전체 1개
+        self.srt_mode = srt_mode if srt_mode in ("none", "per_file", "merged") else "none"
         self.srt_files = []            # 생성된 .srt 경로 목록
-        self._timeline = SrtTimeline() if generate_srt else None
+        self._timeline = SrtTimeline() if self.srt_mode != "none" else None
         self._written_samples = 0      # 지금까지 파일로 저장한 전역 샘플 수
         self._last_engine_segments = None  # 엔진이 문장 단위로 준 구간 (Kokoro)
+        self._stream_writer = None     # 분할 없이 저장할 때 쓰는 스트리밍 핸들
 
     def run(self):
         try:
@@ -226,7 +231,7 @@ class TTSWorker(QThread):
         sf.write(wav_path, data, sample_rate)
         audio_path = self._convert_wav_to_mp3(wav_path)
 
-        if self._timeline is not None:
+        if self.srt_mode == "per_file" and self._timeline is not None:
             start = self._written_samples
             end = start + len(data)
             cues = self._timeline.cues_for_range(start, end, sample_rate)
@@ -236,6 +241,54 @@ class TTSWorker(QThread):
 
         self._written_samples += len(data)
         return audio_path
+
+    def _stream_write(self, data, sample_rate):
+        """분할 없이 저장하는 모드: 청크를 그때그때 WAV에 이어 쓴다.
+
+        오디오 전체를 메모리에 들고 있으면 장편에서 수 GB가 되므로,
+        soundfile 핸들을 열어 두고 디스크로 흘려보낸다."""
+        import soundfile as sf
+        if self._stream_writer is None:
+            self._stream_writer = sf.SoundFile(
+                self.output_path, mode='w', samplerate=int(sample_rate), channels=1,
+            )
+        self._stream_writer.write(data)
+        self._written_samples += len(data)
+
+    def _finish_stream(self, sample_rate):
+        """스트리밍 저장 마무리: 파일 닫고 MP3 변환 + 통합 자막 저장."""
+        if self._stream_writer is None:
+            return None
+        self._stream_writer.close()
+        self._stream_writer = None
+
+        audio_path = self._convert_wav_to_mp3(self.output_path)
+
+        if self._timeline is not None:
+            # 분할이 없으므로 per_file / merged 모두 결과가 같다 (파일 1개 = 자막 1개)
+            cues = self._timeline.cues_for_range(0, self._written_samples, sample_rate)
+            srt_path = write_srt(audio_path, cues)
+            if srt_path:
+                self.srt_files.append(srt_path)
+        return audio_path
+
+    def _write_merged_srt(self, sample_rate):
+        """전체 오디오를 아우르는 .srt 1개를 저장 (merged 모드).
+
+        시간은 첫 번째 오디오 파일의 0초부터 누적된 값이다. Simon Reader는
+        .srt를 책으로 등록했을 때 형제 오디오 파일들의 길이를 누적해 각 파일이
+        담당하는 구간을 잘라내므로(align_srt_book_native), 통합 타임라인이어야
+        한다. 파일명은 출력 파일명 그대로이고 _01/_02 접미사가 붙지 않는다."""
+        if self.srt_mode != "merged" or self._timeline is None:
+            return None
+        if not sample_rate or self._written_samples <= 0:
+            return None
+
+        cues = self._timeline.cues_for_range(0, self._written_samples, sample_rate)
+        srt_path = write_srt(self.output_path, cues)
+        if srt_path:
+            self.srt_files.append(srt_path)
+        return srt_path
 
     def _run_generation(self, torch, start_time):
         """청크 단위로 음성 생성 후 파일로 저장 (Qwen/Kokoro 공통)"""
@@ -333,8 +386,21 @@ class TTSWorker(QThread):
                     sample_rate = sr
                 max_samples = int(max_duration_sec * sample_rate)
 
-                # 자막 타임라인 기록 (버퍼에 넣기 직전 = 전역 샘플 순서 그대로)
+                # 자막 타임라인 기록 (저장 직전 = 전역 샘플 순서 그대로)
                 self._track_cues(chunk, wav_data, sample_rate)
+
+                if not self.split_audio:
+                    # 분할 없음 → 바로 디스크로 흘려보낸다 (메모리에 쌓지 않음)
+                    self._stream_write(wav_data, sample_rate)
+                    del wav_data
+
+                    chunk_time = time.time() - chunk_start
+                    self.chunk_times.append(chunk_time)
+                    if i > 0:
+                        avg = sum(self.chunk_times) / len(self.chunk_times)
+                        remaining = avg * (total_chunks - (i + 1))
+                        self.eta.emit(f"남은 시간: {self._format_time(remaining)}")
+                    continue
 
                 segment_audio.append(wav_data)
                 segment_samples += len(wav_data)
@@ -366,6 +432,23 @@ class TTSWorker(QThread):
                     remaining_seconds = avg_time_per_chunk * remaining_chunks
                     self.eta.emit(f"남은 시간: {self._format_time(remaining_seconds)} | 저장된 파일: {file_idx}개")
 
+            # 분할 없음 모드 마무리 (오디오 1개 + 자막 1개)
+            if not self.split_audio:
+                was_stopped = not self._is_running
+                audio_path = self._finish_stream(sample_rate)
+                if audio_path is None:
+                    self.error.emit("변환할 텍스트가 없습니다.")
+                    return
+                total_time = time.time() - start_time
+                if was_stopped:
+                    self.eta.emit(f"총 소요 시간: {self._format_time(total_time)}")
+                    self.stopped.emit(audio_path)
+                else:
+                    self.eta.emit(f"총 소요 시간: {self._format_time(total_time)}")
+                    self.progress.emit(100)
+                    self.finished_signal.emit(audio_path)
+                return
+
             # 남은 오디오 저장
             if segment_audio:
                 combined = np.concatenate(segment_audio)
@@ -375,6 +458,7 @@ class TTSWorker(QThread):
                     # 중지 + 파일 없음 → partial로 저장
                     partial_path = f"{base_path}_partial.wav"
                     mp3_path = self._flush_audio(combined, partial_path, sample_rate)
+                    self._write_merged_srt(sample_rate)
                     self.stopped.emit(mp3_path)
                     return
                 elif was_stopped:
@@ -383,6 +467,7 @@ class TTSWorker(QThread):
                     partial_path = f"{base_path}_{file_idx:02d}_partial.wav"
                     mp3_path = self._flush_audio(combined, partial_path, sample_rate)
                     saved_files.append(mp3_path)
+                    self._write_merged_srt(sample_rate)
                     self.stopped.emit(saved_files[0])
                     return
                 else:
@@ -393,6 +478,7 @@ class TTSWorker(QThread):
                         self.eta.emit(f"총 소요 시간: {self._format_time(total_time)}")
                         self.progress.emit(100)
                         mp3_path = self._flush_audio(combined, self.output_path, sample_rate)
+                        self._write_merged_srt(sample_rate)
                         self.finished_signal.emit(mp3_path)
                         return
                     else:
@@ -401,6 +487,8 @@ class TTSWorker(QThread):
                         mp3_path = self._flush_audio(combined, segment_path, sample_rate)
                         saved_files.append(mp3_path)
                 del combined
+
+            self._write_merged_srt(sample_rate)
 
             if saved_files:
                 total_time = time.time() - start_time

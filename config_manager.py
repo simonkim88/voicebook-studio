@@ -30,11 +30,26 @@ TTS_ENGINE_OPTIONS = [
     ("kokoro", "Kokoro-82M (영어 전용, 경량·고속, 스타일 프롬프트 미지원)"),
 ]
 
-# 출력 형식 (오디오만 / 오디오 + 자막)
+# 출력 형식
+#
+# 자막은 항상 .srt 1개로 만든다. Simon Reader에 .srt를 책으로 등록하면
+# (align_srt_book_native) 형제 오디오 파일들의 길이를 누적해 각 파일이 담당하는
+# 구간을 잘라내므로, 자막은 첫 파일 0초부터 이어지는 하나의 타임라인이어야 한다.
+#
+# 오디오까지 1개로 만들면 Simon Reader가 길이를 누적할 필요 없이 절대 시간을
+# 그대로 쓰므로 매칭이 가장 정확하다 (파일 경계 오차가 아예 없음).
 OUTPUT_FORMAT_OPTIONS = [
     ("audio", "오디오만 (MP3)"),
-    ("audio_srt", "오디오 + 자막(.srt)"),
+    ("audio_srt", "오디오 + 자막 (오디오는 10분 분할, .srt 1개)"),
+    ("audio_srt_single", "오디오 1개 + 자막 1개 (분할 없음, 매칭 정확도 최고)"),
 ]
+
+# 출력 형식 → (srt_mode, split_audio)
+OUTPUT_FORMAT_SETTINGS = {
+    "audio":            ("none",   True),
+    "audio_srt":        ("merged", True),
+    "audio_srt_single": ("merged", False),
+}
 
 def get_default_config():
     """기본 설정 반환"""

@@ -8,7 +8,8 @@ import glob
 # 모듈 임포트
 from config_manager import (
     load_config, save_config, get_device, DEFAULT_OUTPUT_DIR,
-    MODEL_SIZE_OPTIONS, TTS_ENGINE_OPTIONS, OUTPUT_FORMAT_OPTIONS
+    MODEL_SIZE_OPTIONS, TTS_ENGINE_OPTIONS, OUTPUT_FORMAT_OPTIONS,
+    OUTPUT_FORMAT_SETTINGS
 )
 from document_parser import (
     DocumentParser, VOICE_OPTIONS, load_custom_voices, CUSTOM_VOICE_PRESETS,
@@ -164,7 +165,7 @@ class MainWindow(QMainWindow):
         output_format_group = QGroupBox("출력 형식")
         output_format_layout = QVBoxLayout(output_format_group)
 
-        radio_row = QHBoxLayout()
+        radio_row = QVBoxLayout()
         self.output_format_buttons = QButtonGroup(self)
         saved_format = self.config.get("output_format", "audio")
         for value, label in OUTPUT_FORMAT_OPTIONS:
@@ -184,9 +185,10 @@ class MainWindow(QMainWindow):
         self.output_format_buttons.buttonClicked.connect(self.on_output_format_changed)
 
         output_format_desc = QLabel(
-            "• 오디오만: MP3 파일만 생성\n"
-            "• 오디오 + 자막: 각 MP3와 같은 이름의 .srt 자막을 함께 생성\n"
-            "  (Simon Reader에 그대로 올려 오디오-텍스트 매칭에 사용)"
+            "• 자막(.srt)은 항상 1개로 생성되며, 전체 오디오를 이어지는 하나의\n"
+            "  타임라인으로 담습니다 (Simon Reader 오디오-텍스트 매칭용).\n"
+            "• '분할 없음'은 오디오도 1개로 만들어 파일 경계 오차가 없으므로\n"
+            "  매칭이 가장 정확합니다. 대신 파일 하나가 매우 커집니다."
         )
         output_format_desc.setStyleSheet("color: #666; font-size: 11px;")
         output_format_layout.addWidget(output_format_desc)
@@ -884,6 +886,9 @@ class MainWindow(QMainWindow):
             ref_text = CUSTOM_VOICE_PRESETS[voice]["ref_text"]
 
         model_size = self.model_size_combo.currentData()
+        srt_mode, split_audio = OUTPUT_FORMAT_SETTINGS.get(
+            self._current_output_format(), ("none", True)
+        )
         # Kokoro 음성의 언어 코드 (예: af_heart -> 'a')
         kokoro_lang_code = KOKORO_VOICES.get(voice, {}).get("lang_code", "a")
 
@@ -893,8 +898,9 @@ class MainWindow(QMainWindow):
             is_custom_voice=is_custom, ref_audio_path=ref_audio_path, ref_text=ref_text,
             model_size=model_size,
             tts_engine=engine, kokoro_lang_code=kokoro_lang_code,
-            generate_srt=(self._current_output_format() == "audio_srt"),
+            srt_mode=srt_mode,
         )
+        self.tts_worker.split_audio = split_audio
         self.tts_worker.progress.connect(self.update_progress)
         self.tts_worker.status.connect(self.update_status)
         self.tts_worker.eta.connect(self.update_eta)
@@ -940,8 +946,9 @@ class MainWindow(QMainWindow):
 
         srt_files = getattr(self.tts_worker, "srt_files", []) if self.tts_worker else []
         if srt_files:
-            message += (f"\n📝 자막(.srt) {len(srt_files)}개도 함께 생성되었습니다.\n"
-                        f"오디오와 파일명이 같으므로 Simon Reader에 그대로 올리면 매칭됩니다.")
+            message += (f"\n\n📝 자막 파일:\n• {srt_files[0]}\n\n"
+                        f"Simon Reader에 이 .srt를 책으로 등록한 뒤 MP3를 올리면\n"
+                        f"오디오-텍스트 매칭이 자동으로 이루어집니다.")
 
         QMessageBox.information(self, "완료", message)
     
