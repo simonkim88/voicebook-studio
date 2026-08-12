@@ -8,15 +8,29 @@ merge_audiobook.py - 파트별 mp3 + srt를 순서대로 이어붙여 통합본 
 (둘은 몇 초 어긋날 수 있고, 그 오차가 뒤로 갈수록 누적되기 때문).
 
   python merge_audiobook.py
+  python merge_audiobook.py --base "책 제목" --parts "Part 1" "Part 2" --dir D:/audiofiles
+
+ffmpeg / ffprobe 가 필요하다. PATH에 없으면 환경변수 FFMPEG / FFPROBE 로 지정할 수 있다.
 """
 
+import argparse
 import os
 import subprocess
 import sys
 
-AUDIO_DIR = "/Users/simon/Documents/Qwen3-TTSApp/audiofiles"
-BASE = "Why the World Does Not Exist"
-PARTS = ["Part 1", "Part 2-3", "Part 4", "Part 5", "Part 6-7"]  # 이어붙일 순서
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import platform_utils as pu
+from config_manager import load_config
+
+pu.use_utf8_console()
+
+DEFAULT_BASE = "Why the World Does Not Exist"
+DEFAULT_PARTS = ["Part 1", "Part 2-3", "Part 4", "Part 5", "Part 6-7"]  # 이어붙일 순서
+
+AUDIO_DIR = ""  # main()에서 설정 (config.json 또는 --dir)
+BASE = DEFAULT_BASE
+PARTS = list(DEFAULT_PARTS)
 OUT_STEM = f"{BASE}_FULL"
 
 
@@ -33,10 +47,10 @@ def duration(path):
     (concat -c copy 는 프레임을 그대로 보존하므로 합이 통합본과 일치한다).
     """
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-count_packets",
-         "-show_entries", "stream=nb_read_packets,sample_rate",
+        [pu.require_tool("ffprobe"), "-v", "error", "-select_streams", "a:0",
+         "-count_packets", "-show_entries", "stream=nb_read_packets,sample_rate",
          "-of", "default=nw=1:nk=1", path],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, creationflags=pu.NO_WINDOW,
     ).stdout.split()
     sample_rate, packets = int(out[0]), int(out[1])
     frame_samples = 1152 if sample_rate >= 32000 else 576  # MPEG-1 / MPEG-2·2.5 Layer III
@@ -76,7 +90,39 @@ def parse_srt(path):
     return cues
 
 
+def concat_entry(path):
+    """concat 데멀서용 한 줄.
+
+    Windows 경로의 역슬래시는 concat 파서에서 이스케이프 문자로 먹히므로
+    슬래시로 바꾼다 (ffmpeg는 Windows에서도 D:/foo/bar.mp3 를 그대로 받는다).
+    작은따옴표는 concat 문법대로 '\\'' 로 탈출시킨다.
+    """
+    safe = path.replace("\\", "/").replace("'", r"'\''")
+    return f"file '{safe}'\n"
+
+
 def main():
+    global AUDIO_DIR, BASE, PARTS, OUT_STEM
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dir", help="오디오 폴더 (생략하면 config.json 의 output_directory)")
+    ap.add_argument("--base", default=DEFAULT_BASE, help="파일명 공통 접두사(책 제목)")
+    ap.add_argument("--parts", nargs="+", default=DEFAULT_PARTS,
+                    help="이어붙일 순서대로 나열한 파트 이름")
+    ap.add_argument("--out-stem", help="통합본 파일명 (생략하면 <base>_FULL)")
+    args = ap.parse_args()
+
+    AUDIO_DIR = os.path.abspath(os.path.expanduser(
+        args.dir or load_config().get("output_directory")))
+    BASE = args.base
+    PARTS = args.parts
+    OUT_STEM = args.out_stem or f"{BASE}_FULL"
+
+    if not os.path.isdir(AUDIO_DIR):
+        sys.exit(f"❌ 폴더가 없습니다: {AUDIO_DIR}")
+    pu.require_tool("ffmpeg")
+    pu.require_tool("ffprobe")
+
     out_mp3 = os.path.join(AUDIO_DIR, OUT_STEM + ".mp3")
     out_srt = os.path.join(AUDIO_DIR, OUT_STEM + ".srt")
 
@@ -104,14 +150,16 @@ def main():
     list_path = os.path.join(AUDIO_DIR, ".concat_list.txt")
     with open(list_path, "w", encoding="utf-8") as f:
         for part in PARTS:
-            f.write(f"file '{part_paths(part)[0]}'\n")
+            f.write(concat_entry(part_paths(part)[0]))
     print(f"\n오디오 병합 중 → {os.path.basename(out_mp3)}")
-    subprocess.run(
-        ["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0",
-         "-i", list_path, "-c", "copy", out_mp3],
-        check=True,
-    )
-    os.remove(list_path)
+    try:
+        subprocess.run(
+            [pu.require_tool("ffmpeg"), "-v", "error", "-y", "-f", "concat",
+             "-safe", "0", "-i", list_path, "-c", "copy", out_mp3],
+            check=True, creationflags=pu.NO_WINDOW,
+        )
+    finally:
+        os.remove(list_path)
 
     # 3) 자막 이어붙이기 (앞 파트 길이만큼 시각 이동)
     print(f"자막 병합 중 → {os.path.basename(out_srt)}")

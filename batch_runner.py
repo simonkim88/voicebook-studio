@@ -13,50 +13,38 @@ GUI에서 돌린 것과 동일한 조건(목소리/엔진/모델/출력형식)�
   3) --quit-gui 면 GUI 앱 종료 (메모리 확보)
   4) 파일을 하나씩 변환. 하나가 실패해도 다음 파일로 계속 진행
   5) 이미 완성본(.wav + .srt)이 있으면 건너뜀 → 중단 후 재실행해도 이어서 진행
+
+macOS / Windows / Linux 공통으로 동작한다. 로그 경로, 데스크톱 알림, GUI 앱
+탐색/종료 방식만 OS별로 갈라지고 나머지 흐름은 동일하다.
 """
 
 import argparse
+import functools
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PyQt6.QtCore import QCoreApplication
 
+import platform_utils as pu
 from config_manager import load_config, get_device, OUTPUT_FORMAT_SETTINGS
 from document_parser import DocumentParser, CUSTOM_VOICE_PRESETS, load_custom_voices
 from tts_worker import TTSWorker
 
+pu.use_utf8_console()
+
 INSTRUCT_TEXT = "자연스럽고 편안한 톤으로 읽어주세요."
-LOG_PATH = os.path.expanduser("~/Library/Logs/VoiceBookBatch.log")
 LOCAL_INPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "batch_input")
+GUI_SCRIPT = "voicebook_studio_v1.0.py"
 
-
-def log(msg):
-    line = f"[{datetime.now():%m-%d %H:%M:%S}] {msg}"
-    # 백그라운드 실행 시 stdout도 같은 로그 파일로 리다이렉트되므로,
-    # 터미널에서 직접 돌릴 때만 화면에 찍는다 (중복 기록 방지).
-    if sys.stdout.isatty():
-        print(line, flush=True)
-    with open(LOG_PATH, "a") as f:
-        f.write(line + "\n")
-
-
-def notify(message):
-    """macOS 알림 센터로 알림. 반드시 논블로킹(display notification)으로."""
-    try:
-        subprocess.Popen(
-            ["osascript", "-e",
-             f'display notification "{message}" with title "VoiceBook 배치"'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pass
+log = pu.make_logger("VoiceBookBatch.log", env_var="VOICEBOOK_BATCH_LOG")
+LOG_PATH = log.path
+notify = functools.partial(pu.notify, title="VoiceBook 배치")
 
 
 def fmt(seconds):
@@ -103,11 +91,8 @@ def stage_inputs(paths):
 
 
 def gui_pids():
-    out = subprocess.run(
-        ["pgrep", "-f", "bin/python .*voicebook_studio_v1.0.py"],
-        capture_output=True, text=True,
-    ).stdout.split()
-    return [int(p) for p in out if p.isdigit()]
+    """실행 중인 GUI 앱의 PID 목록."""
+    return pu.find_python_pids(GUI_SCRIPT)
 
 
 def wait_for_current_job(wav_path, poll=60):
@@ -161,20 +146,14 @@ def quit_gui():
         return
     for pid in pids:
         log(f"   GUI 앱 종료 (PID {pid})")
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            continue
+        pu.terminate_pid(pid)
     for _ in range(30):
         time.sleep(1)
         if not gui_pids():
             log("   ✅ 종료 완료 — 메모리 확보")
             return
     for pid in gui_pids():
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        pu.terminate_pid(pid, force=True)
     log("   ✅ 종료 완료 (강제)")
 
 
@@ -322,8 +301,9 @@ def main():
                 ok += 1
             else:
                 log(f"❌ 자식 프로세스 종료 코드 {r.returncode}: {os.path.basename(path)}")
-                if r.returncode < 0:
-                    log(f"   시그널 {-r.returncode}로 종료됨 (메모리 부족에 의한 강제 종료 가능성)")
+                detail = pu.describe_exit_code(r.returncode)
+                if detail:
+                    log(f"   {detail}")
         except Exception as e:  # 한 파일이 죽어도 큐는 계속
             import traceback
             log(f"❌ 예외 발생: {os.path.basename(path)} — {e}")

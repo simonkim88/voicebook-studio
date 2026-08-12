@@ -6,15 +6,41 @@
 #
 # 만들어진 앱은 Finder/Spotlight/Dock에서 바로 실행되며,
 # launchd가 부모 프로세스라 터미널이나 Claude Code 세션과 무관하게 계속 살아있습니다.
+#
+# .app 번들은 macOS 전용입니다. Windows에서는 make_shortcut.ps1 로
+# 시작 메뉴·바탕화면 바로가기를 만드세요 (동작은 동일합니다).
 
 set -euo pipefail
+
+if [ "$(uname -s)" != "Darwin" ]; then
+    echo "❌ make_app.sh 는 macOS 전용입니다 (.app 번들 생성)."
+    echo "   Windows: powershell -ExecutionPolicy Bypass -File make_shortcut.ps1"
+    echo "   Linux  : python launch_voicebook.py 를 직접 실행하거나 .desktop 파일을 만드세요."
+    exit 1
+fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST_DIR="${1:-/Applications}"
 APP="$DEST_DIR/VoiceBook Studio.app"
-PYTHON="$HOME/miniconda3/envs/qwen3-tts/bin/python"
+
+find_python() {
+    [ -n "${VOICEBOOK_PYTHON:-}" ] && { echo "$VOICEBOOK_PYTHON"; return; }
+    for candidate in \
+        "$REPO_DIR/venv/bin/python" \
+        "$REPO_DIR/.venv/bin/python" \
+        "$HOME/miniconda3/envs/qwen3-tts/bin/python" \
+        "$HOME/anaconda3/envs/qwen3-tts/bin/python"
+    do
+        [ -x "$candidate" ] && { echo "$candidate"; return; }
+    done
+    command -v python3 || command -v python
+}
+
+PYTHON="$(find_python)"
+[ -x "$PYTHON" ] || { echo "❌ 파이썬을 찾을 수 없습니다. VOICEBOOK_PYTHON 을 지정하세요."; exit 1; }
 
 echo "▶ 대상: $APP"
+echo "▶ 파이썬: $PYTHON"
 
 # ---------------------------------------------------------------- 아이콘
 if [ ! -f "$REPO_DIR/assets/AppIcon.icns" ]; then
@@ -75,40 +101,32 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 # ---------------------------------------------------------------- 런처
+# 중복 실행 방지·로깅·실패 알림은 launch_voicebook.py 가 처리합니다
+# (Windows 바로가기와 같은 코드를 씁니다).
 cat > "$APP/Contents/MacOS/VoiceBookStudio" <<LAUNCHER
 #!/bin/bash
 # VoiceBook Studio 런처 (make_app.sh 가 생성 — 직접 수정하지 말 것)
 
 APP_DIR="$REPO_DIR"
 PYTHON="$PYTHON"
-MAIN="voicebook_studio_v1.0.py"
+LAUNCHER_PY="\$APP_DIR/launch_voicebook.py"
 LOG="\$HOME/Library/Logs/VoiceBookStudio.log"
 
 mkdir -p "\$(dirname "\$LOG")"
-exec >>"\$LOG" 2>&1
-echo "===== launch \$(date '+%Y-%m-%d %H:%M:%S') ====="
 
 fail() {
-    echo "ERROR: \$1"
-    /usr/bin/osascript -e "display alert \"VoiceBook Studio를 실행할 수 없습니다\" message \"\$1\" as critical" >/dev/null 2>&1
+    echo "ERROR: \$1" >>"\$LOG"
+    /usr/bin/osascript -e "display notification \"\$1\" with title \"VoiceBook Studio 실행 실패\"" >/dev/null 2>&1 &
     exit 1
 }
 
-# 이미 실행 중이면 두 번 띄우지 않음 (TTS 모델이 메모리를 크게 차지).
-# 알림은 반드시 논블로킹(display notification)으로 — display alert 는 응답할 때까지
-# 런처 프로세스를 붙잡고, 그동안 macOS가 앱을 "실행 중"으로 봐서 재실행이 막힙니다.
-if /usr/bin/pgrep -f "bin/python .*\$MAIN" >/dev/null 2>&1; then
-    echo "already running — skip"
-    /usr/bin/osascript -e 'display notification "이미 실행 중입니다. 열려 있는 창을 사용하세요." with title "VoiceBook Studio"' >/dev/null 2>&1 &
-    exit 0
-fi
-
-[ -x "\$PYTHON" ] || fail "Python 환경을 찾을 수 없습니다: \$PYTHON (conda 환경 qwen3-tts 확인 필요)"
-[ -f "\$APP_DIR/\$MAIN" ] || fail "앱 파일을 찾을 수 없습니다: \$APP_DIR/\$MAIN"
+[ -x "\$PYTHON" ] || fail "Python 환경을 찾을 수 없습니다: \$PYTHON"
+[ -f "\$LAUNCHER_PY" ] || fail "런처를 찾을 수 없습니다: \$LAUNCHER_PY"
 cd "\$APP_DIR" || fail "폴더로 이동할 수 없습니다: \$APP_DIR"
 
 # exec: 스크립트 프로세스를 파이썬으로 교체 → 앱 종료 = 프로세스 종료
-exec "\$PYTHON" "\$MAIN"
+# (launch_voicebook.py 도 내부에서 exec 하므로 이 PID가 그대로 GUI가 됩니다)
+exec "\$PYTHON" "\$LAUNCHER_PY"
 LAUNCHER
 chmod +x "$APP/Contents/MacOS/VoiceBookStudio"
 
