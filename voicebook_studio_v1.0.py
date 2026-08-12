@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QGridLayout, QLineEdit, QRadioButton, QButtonGroup, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QUrl
-from PyQt6.QtGui import QFont, QAction
+from PyQt6.QtGui import QFont, QAction, QIcon
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 
@@ -1084,7 +1084,12 @@ if __name__ == "__main__":
     
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    
+
+    # Dock/작업표시줄 아이콘 (앱 번들 밖에서 실행될 때도 적용)
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.png")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+
     if sys.platform == "darwin":
         font = QFont("SF Pro", 13)
     else:

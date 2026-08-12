@@ -10,3 +10,7 @@ venv/
 audiofiles/
 config.json
 app.log
+
+# 로컬 전용 (커밋 금지)
+telegram_config.json
+batch_input/
