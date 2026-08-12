@@ -88,6 +88,12 @@ class TTSWorker(QThread):
         # 전체를 메모리에 쌓지 않고 디스크로 스트리밍 저장한다.
         self.split_audio = True
 
+        # 한 번에 묶어 생성할 청크 수의 상한. None 이면 _effective_batch_size() 가 자동 결정.
+        self.batch_size = None
+        # 한 배치의 글자 수 예산. VRAM 사용량은 청크 개수가 아니라 총 길이를 따라가므로
+        # 개수만 고정하면 긴 청크가 몰릴 때 OOM 이 난다 (500자×6 = 6.6G 확인).
+        self.batch_chars = 2000
+
         # SRT 자막(오디오-텍스트 매칭) 출력
         # "none": 만들지 않음 / "per_file": 오디오 파일마다 1개 / "merged": 전체 1개
         self.srt_mode = srt_mode if srt_mode in ("none", "per_file", "merged") else "none"
@@ -306,10 +312,146 @@ class TTSWorker(QThread):
             self.srt_files.append(srt_path)
         return srt_path
 
+    def _effective_batch_size(self):
+        """한 번에 묶어 생성할 청크 수의 상한.
+
+        청크를 하나씩 자기회귀로 돌리면 GPU 가 매 스텝 아주 작은 연산만 받아
+        사용률이 30% 대에 머문다. 여러 청크를 리스트로 묶어 넘기면 같은 시간에
+        여러 개를 만들 수 있다 (RTX 4060 Ti / 0.6B, 실측 기준):
+
+            B=1  RTF 0.281 (기존)
+            B=4  RTF 0.581
+            B=6  RTF 0.856
+            B=8  RTF 0.897
+            B=12 RTF 0.927   ← 이 이상은 이득이 거의 없다
+
+        CUDA 가 아니면(맥 MPS/CPU) 1 을 써서 기존 동작을 그대로 유지한다.
+        Kokoro 와 보이스클론은 배치 경로가 검증되지 않아 역시 1.
+        """
+        if self.batch_size:
+            return max(1, int(self.batch_size))
+        if self.device != "cuda":
+            return 1
+        if self.tts_engine != "qwen" or self.is_custom_voice:
+            return 1
+        return 8
+
+    def _group_chunks(self, chunks):
+        """청크를 배치 단위로 묶는다. 개수 상한과 글자 수 예산을 함께 적용.
+
+        VRAM 은 청크 개수가 아니라 배치의 총 길이를 따라간다. 이 책의 청크는
+        문단 단위라 보통 100~200자지만 최대 500자까지 나올 수 있어서, 개수만
+        고정하면 긴 청크가 몰린 구간에서 OOM 이 난다. 글자 수로 상한을 두면
+        짧은 청크는 많이, 긴 청크는 적게 묶여 VRAM 이 자연히 평평해진다.
+        """
+        max_n = self._effective_batch_size()
+        budget = max(1, int(self.batch_chars or 0)) if max_n > 1 else 0
+        group, used = [], 0
+        for c in chunks:
+            if group and (len(group) >= max_n or (budget and used + len(c) > budget)):
+                yield group
+                group, used = [], 0
+            group.append(c)
+            used += len(c)
+        if group:
+            yield group
+
+    def _call_engine(self, torch, texts):
+        """엔진 호출. texts 는 항상 리스트. CUDA 에러 시 최대 3회 재시도."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                with torch.no_grad():
+                    if self.tts_engine == "kokoro":
+                        return self._synthesize_kokoro(texts[0])
+                    if self.is_custom_voice:
+                        from document_parser import CUSTOM_VOICE_PRESETS
+                        voice_info = CUSTOM_VOICE_PRESETS.get(self.voice, {})
+                        return self.model.generate_voice_clone(
+                            text=texts[0],
+                            language=voice_info.get("language", "Korean"),
+                            voice_clone_prompt=self.voice_clone_prompt,
+                            max_new_tokens=2048,
+                        )
+                    language = "Korean" if self.voice == "Sohee" else "Auto"
+                    instruct = self.instruct_text if self.instruct_text else None
+                    if len(texts) == 1:
+                        # 단건은 기존과 완전히 동일한 호출 형태를 유지한다
+                        return self.model.generate_custom_voice(
+                            text=texts[0], language=language, speaker=self.voice,
+                            instruct=instruct, max_new_tokens=2048,
+                        )
+                    n = len(texts)
+                    return self.model.generate_custom_voice(
+                        text=list(texts), language=[language] * n,
+                        speaker=[self.voice] * n, instruct=[instruct] * n,
+                        max_new_tokens=2048,
+                    )
+            except torch.cuda.OutOfMemoryError:
+                raise          # VRAM 부족은 _generate_batch 가 배치를 줄여 처리한다
+            except RuntimeError as e:
+                if "CUDA" in str(e) and attempt < max_retries - 1:
+                    self.status.emit(f"⚠️ CUDA 에러 발생, 재시도 중... ({attempt+2}/{max_retries})")
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    import gc; gc.collect()
+                    time.sleep(1)
+                else:
+                    raise
+        return None, None
+
+    def _generate_batch(self, torch, texts):
+        """texts 와 1:1 로 대응하는 오디오 리스트를 반환 (실패분은 None).
+
+        VRAM 이 부족하면 배치를 절반으로 쪼개 재시도한다. 순서는 그대로 지킨다 —
+        자막 타임라인이 청크 순서에 의존하기 때문에 어긋나면 안 된다.
+        """
+        try:
+            wavs, sr = self._call_engine(torch, texts)
+            if wavs is None:
+                return [None] * len(texts), None
+            return list(wavs), sr
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if len(texts) == 1:
+                self.status.emit("⚠️ VRAM 부족 — 이 청크를 건너뜁니다")
+                return [None], None
+            half = len(texts) // 2
+            self.status.emit(f"⚠️ VRAM 부족 — 배치 {len(texts)} → {half} 로 줄여 재시도")
+            left, sr1 = self._generate_batch(torch, texts[:half])
+            right, sr2 = self._generate_batch(torch, texts[half:])
+            return left + right, (sr1 or sr2)
+
+    def _iter_generated(self, torch, chunks):
+        """청크를 배치로 묶어 생성하고 입력 순서대로 하나씩 내보낸다.
+
+        yield: (청크 텍스트, 오디오 numpy, 샘플레이트, 이 청크에 배분된 생성 시간)
+        """
+        for group in self._group_chunks(chunks):
+            if not self._is_running:
+                return
+            t0 = time.time()
+            wavs, sr = self._generate_batch(torch, group)
+            per_chunk = (time.time() - t0) / max(1, len(group))
+
+            for text, wav in zip(group, wavs):
+                if wav is None:
+                    continue          # 생성 실패한 청크는 건너뛴다
+                # 오디오 데이터를 CPU numpy로 즉시 이동 (GPU 메모리 해제)
+                if hasattr(wav, 'cpu'):
+                    wav = wav.cpu().numpy()
+                elif hasattr(wav, 'numpy'):
+                    wav = wav.numpy()
+                yield text, wav, sr, per_chunk
+
+            del wavs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     def _run_generation(self, torch, start_time):
         """청크 단위로 음성 생성 후 파일로 저장 (Qwen/Kokoro 공통)"""
         try:
-            chunks = self._chunk_text(self.text)
+            chunks = [c for c in self._chunk_text(self.text) if c.strip()]
             total_chunks = len(chunks)
 
             import soundfile as sf
@@ -324,73 +466,23 @@ class TTSWorker(QThread):
             file_idx = 0             # 저장된 파일 번호
             saved_files = []
 
-            for i, chunk in enumerate(chunks):
+            # 생성은 _iter_generated 가 배치로 처리하고, 여기서는 입력 순서대로
+            # 하나씩 받아 저장한다 (자막 타임라인이 순서에 의존하므로 순서 보존이 중요).
+            for i, (chunk, wav_data, sr, gen_time) in enumerate(
+                    self._iter_generated(torch, chunks)):
                 # 중지 확인
                 if not self._is_running:
                     self.status.emit("⏹️ 사용자에 의해 중지됨. 현재까지 진행된 내용 저장 중...")
                     break
 
-                chunk_start = time.time()
-
-                if not chunk.strip():
-                    continue
+                # 배치에 배분된 생성 시간까지 포함해 ETA를 계산한다
+                chunk_start = time.time() - gen_time
 
                 # 진행률 계산 (10% ~ 95% 범위에서 청크 진행률 반영)
                 chunk_progress = ((i + 1) / total_chunks) * 85
                 progress = int(10 + chunk_progress)
                 self.progress.emit(progress)
                 self.status.emit(f"처리 중... {i+1}/{total_chunks} 청크 ({progress}%) | 저장된 파일: {file_idx}개")
-
-                # TTS 생성 (CUDA 에러 시 최대 3회 재시도)
-                import torch
-                max_retries = 3
-                wavs, sr = None, None
-                for attempt in range(max_retries):
-                    try:
-                        with torch.no_grad():
-                            if self.tts_engine == "kokoro":
-                                wavs, sr = self._synthesize_kokoro(chunk)
-                            elif self.is_custom_voice:
-                                from document_parser import CUSTOM_VOICE_PRESETS
-                                voice_info = CUSTOM_VOICE_PRESETS.get(self.voice, {})
-                                language = voice_info.get("language", "Korean")
-                                wavs, sr = self.model.generate_voice_clone(
-                                    text=chunk,
-                                    language=language,
-                                    voice_clone_prompt=self.voice_clone_prompt,
-                                    max_new_tokens=2048,
-                                )
-                            else:
-                                wavs, sr = self.model.generate_custom_voice(
-                                    text=chunk,
-                                    language="Korean" if self.voice == "Sohee" else "Auto",
-                                    speaker=self.voice,
-                                    instruct=self.instruct_text if self.instruct_text else None,
-                                    max_new_tokens=2048,
-                                )
-                        break  # 성공 시 루프 탈출
-                    except RuntimeError as e:
-                        if "CUDA" in str(e) and attempt < max_retries - 1:
-                            self.status.emit(f"⚠️ CUDA 에러 발생, 재시도 중... ({attempt+2}/{max_retries})")
-                            torch.cuda.synchronize()
-                            torch.cuda.empty_cache()
-                            import gc; gc.collect()
-                            time.sleep(1)
-                        else:
-                            raise
-                if wavs is None:
-                    continue  # 생성 실패 시 다음 청크로
-
-                # 오디오 데이터를 CPU numpy로 즉시 이동 (GPU 메모리 해제)
-                wav_data = wavs[0]
-                if hasattr(wav_data, 'cpu'):
-                    wav_data = wav_data.cpu().numpy()
-                elif hasattr(wav_data, 'numpy'):
-                    wav_data = wav_data.numpy()
-
-                del wavs
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
                 # 볼륨 정규화 (peak normalization → -1dB target)
                 peak = np.max(np.abs(wav_data))
