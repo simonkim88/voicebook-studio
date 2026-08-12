@@ -29,12 +29,16 @@ from datetime import timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# tts_worker 를 PyQt6 보다 먼저 import 한다. tts_worker 상단의 Windows 전용
+# onnxruntime 선로딩이 PyQt6 보다 앞서 실행되어야 하기 때문 (자세한 내용은 그쪽 주석).
+# macOS/Linux 에서는 import 순서만 바뀔 뿐 동작 차이가 없다.
+from tts_worker import TTSWorker, QWEN_AVAILABLE
+
 from PyQt6.QtCore import QCoreApplication
 
 import platform_utils as pu
 from config_manager import load_config, get_device, OUTPUT_FORMAT_SETTINGS
 from document_parser import DocumentParser, CUSTOM_VOICE_PRESETS, load_custom_voices
-from tts_worker import TTSWorker
 
 pu.use_utf8_console()
 
@@ -166,6 +170,14 @@ def convert(text_path, out_dir, cfg, device):
         log(f"⏭️  이미 완료됨, 건너뜀: {stem}")
         return True
 
+    # Mock 모드 방지: qwen 엔진인데 qwen_tts 가 로드되지 않았으면 TTSWorker 는
+    # 3초짜리 사인파를 쓰고 성공 시그널을 보낸다. 그대로 두면 "성공 4/4" 로 끝나면서
+    # 쓸모없는 오디오만 남으므로, 아예 시작하지 않는다.
+    if cfg.get("tts_engine", "qwen") == "qwen" and not QWEN_AVAILABLE:
+        log("❌ 중단: qwen_tts 를 로드할 수 없습니다 (Mock 모드로 빠짐)")
+        log("   'python -c \"from qwen_tts import Qwen3TTSModel\"' 로 원인을 확인하세요.")
+        return False
+
     text = DocumentParser.parse(text_path)
     # 스마트 필터는 쓰지 않는다: Part 2-3에서 본문 8,600자를 본문 시작 오판으로
     # 잘라내는 것을 확인했다. 전문을 그대로 읽힌다.
@@ -191,7 +203,7 @@ def convert(text_path, out_dir, cfg, device):
     )
     worker.split_audio = split_audio
 
-    state = {"pct": -1, "last_log": 0.0, "error": None, "done": False}
+    state = {"pct": -1, "last_log": 0.0, "last_eta": 0.0, "error": None, "done": False}
 
     def on_progress(v):
         now = time.time()
@@ -200,8 +212,16 @@ def convert(text_path, out_dir, cfg, device):
             state["pct"], state["last_log"] = v, now
             log(f"   {stem}: {v}%")
 
+    def on_eta(t):
+        # eta 는 청크마다 올라온다. 그대로 찍으면 장시간 작업에서 로그가 수만 줄이
+        # 되므로 진행률과 같은 5분 간격으로만 남긴다.
+        now = time.time()
+        if now - state["last_eta"] > 300:
+            state["last_eta"] = now
+            log(f"   {stem}: {t}")
+
     worker.progress.connect(on_progress)
-    worker.eta.connect(lambda t: log(f"   {stem}: {t}"))
+    worker.eta.connect(on_eta)
     worker.error.connect(lambda e: state.update(error=e))
     worker.finished_signal.connect(lambda p: state.update(done=True))
 

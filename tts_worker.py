@@ -1,6 +1,22 @@
 # tts_worker.py - TTS 백그라운드 작업 모듈
+import os
 import re
 import time
+
+# Windows 전용 선(先)로딩. macOS/Linux 는 이 블록을 건너뛰므로 기존 동작 그대로다.
+#
+# qwen_tts 는 내부적으로 onnxruntime 을 로드한다. 그런데 Windows 에서 PyQt6 가 먼저
+# 로드되어 있으면 onnxruntime_pybind11_state 의 DLL 초기화가 실패한다
+# ("DLL 초기화 루틴을 실행할 수 없습니다"). 그 결과 아래 qwen_tts import 가
+# ImportError 로 떨어져 QWEN_AVAILABLE 이 False 가 되고, TTSWorker 가 조용히
+# Mock 모드(3초 440Hz 사인파)로 빠진다 — 변환은 "성공"으로 끝나는데 산출물은 쓸모없다.
+# onnxruntime 을 PyQt6 보다 먼저 초기화해 두면 이후 로드는 캐시를 타서 문제가 없다.
+if os.name == "nt":
+    try:
+        import onnxruntime  # noqa: F401
+    except Exception:
+        pass  # 실패해도 아래 qwen_tts import 가 판정하므로 여기서는 넘어간다
+
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
