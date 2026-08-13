@@ -62,6 +62,10 @@ def get_default_config():
         "custom_device": None,  # auto가 아닐 경우 사용
         "model_size": "1.7B",  # 1.7B 또는 0.6B
         "tts_engine": "qwen",  # qwen 또는 kokoro
+        # torch.compile 사용 여부. null이면 GPU(CUDA/MPS)에서 자동 ON.
+        # MPS 실측 1.63배 (RTF 0.53 -> 0.86). 컴파일 결과는 디스크에 캐시되어
+        # 비용은 머신당 한 번만 든다. 문제가 생기면 false 로 끌 수 있다.
+        "torch_compile": None,
         "output_format": "audio",  # audio 또는 audio_srt
     }
 

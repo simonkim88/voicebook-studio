@@ -915,6 +915,7 @@ class MainWindow(QMainWindow):
             srt_mode=srt_mode,
         )
         self.tts_worker.split_audio = split_audio
+        self.tts_worker.torch_compile = self.config.get("torch_compile")
         self.tts_worker.progress.connect(self.update_progress)
         self.tts_worker.status.connect(self.update_status)
         self.tts_worker.eta.connect(self.update_eta)
