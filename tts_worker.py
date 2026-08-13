@@ -55,6 +55,52 @@ def get_attn_implementation(device):
     return "sdpa"
 
 
+_INDUCTOR_PATCHED = False
+
+
+def _patch_inductor_write_atomic():
+    """Windows 에서 inductor 캐시 쓰기가 깨지는 것을 고친다 (torch < 2.6).
+
+    torch/_inductor/codecache.py 의 write_atomic 은 임시 파일을 만든 뒤
+    `tmp_path.rename(path)` 로 옮긴다. POSIX rename 은 대상이 있어도 덮어쓰지만
+    **Windows 는 대상이 이미 있으면 FileExistsError(WinError 183)** 를 낸다.
+    같은 캐시 키를 두 번 쓰는 순간(한 프로세스 안에서도 일어난다) 컴파일이
+    BackendCompilerFailed 로 죽어, Windows 에서는 torch.compile 을 아예 켤 수 없다.
+
+    torch.compile 은 지연 실행이라 이 예외는 compile() 호출이 아니라 **첫
+    forward** 에서 터진다. _apply_torch_compile 의 try/except 로는 잡히지 않고
+    변환 전체를 실패시킨다. 그래서 감싸지 말고 원인을 고친다.
+
+    os.replace 는 두 OS 모두에서 원자적으로 덮어쓴다. 업스트림도 같은 방식으로
+    고쳤으므로, 이미 고쳐진 버전에서는 동작이 달라지지 않는다."""
+    global _INDUCTOR_PATCHED
+    if _INDUCTOR_PATCHED or os.name != "nt":
+        return
+    _INDUCTOR_PATCHED = True
+    try:
+        import threading
+        from pathlib import Path
+        from torch._inductor import codecache
+
+        if getattr(codecache.write_atomic, "_voicebook_patched", False):
+            return
+
+        def write_atomic(path_, content, make_dirs=False, encode_utf_8=False):
+            path = Path(path_)
+            if make_dirs:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.parent / f".{os.getpid()}.{threading.get_ident()}.tmp"
+            mode = "w" if isinstance(content, str) else "wb"
+            with tmp_path.open(mode, encoding="utf-8" if encode_utf_8 else None) as f:
+                f.write(content)
+            os.replace(tmp_path, path)
+
+        write_atomic._voicebook_patched = True
+        codecache.write_atomic = write_atomic
+    except Exception as e:
+        print(f"[warn] inductor 캐시 패치 실패 (torch.compile이 실패할 수 있음): {e}")
+
+
 class TTSWorker(QThread):
     """백그라운드 TTS 처리 스레드 (ETA 계산 포함)"""
     progress = pyqtSignal(int)      # 0-100
@@ -95,6 +141,8 @@ class TTSWorker(QThread):
         self.batch_chars = 2000
         # torch.compile 적용 여부. None 이면 _should_torch_compile() 이 결정.
         self.torch_compile = None
+        # torch.compile 의 mode. None 이면 _torch_compile_mode() 가 디바이스별로 정한다.
+        self.torch_compile_mode = None
 
         # SRT 자막(오디오-텍스트 매칭) 출력
         # "none": 만들지 않음 / "per_file": 오디오 파일마다 1개 / "merged": 전체 1개
@@ -217,6 +265,17 @@ class TTSWorker(QThread):
             return bool(self.torch_compile)
         return self.device in ("cuda", "mps")
 
+    def _torch_compile_mode(self):
+        """torch.compile 에 넘길 mode. worker.torch_compile_mode 로 덮어쓸 수 있다.
+
+        reduce-overhead 는 CUDA graphs 기반이라 CUDA 밖에서는 의미가 없고,
+        CUDA 에서도 이 모델에는 쓸 수 없다. 실측하면 cudagraph_trees 가
+        `assert len(node.tensor_weakrefs) == len(node.stack_traces)` 로 죽는다
+        (RTX 4060 Ti / torch 2.5.1). 자기회귀 루프가 스텝마다 KV 캐시를 늘려
+        그래프 밖에서 살아 있는 텐서를 만들기 때문으로, 캡처 대상으로는
+        맞지 않는다. 따라서 모든 디바이스에서 default 를 쓴다."""
+        return self.torch_compile_mode or "default"
+
     def _apply_torch_compile(self, torch):
         """자기회귀 디코더를 torch.compile로 감싼다.
 
@@ -229,8 +288,8 @@ class TTSWorker(QThread):
         if not hasattr(torch, "compile") or not self._should_torch_compile():
             return
 
-        # reduce-overhead는 CUDA graphs 기반이라 CUDA에서만 의미가 있다.
-        mode = "reduce-overhead" if self.device == "cuda" else "default"
+        _patch_inductor_write_atomic()
+        mode = self._torch_compile_mode()
 
         talker = getattr(getattr(self.model, "model", None), "talker", None)
         if talker is None:
