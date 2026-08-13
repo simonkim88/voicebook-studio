@@ -192,14 +192,18 @@ class TTSWorker(QThread):
     def _should_torch_compile(self):
         """torch.compile을 적용할지 결정.
 
-        CUDA는 reduce-overhead(CUDA graphs) + flash-attn 조합으로 이득이
-        분명해 기본 ON. MPS는 inductor가 Metal 셰이더를 만들어 주긴 하지만
-        KV 캐시 길이가 매 스텝 바뀌어 재컴파일이 잦을 수 있으므로, 벤치마크로
-        확인하기 전까지는 기본 OFF로 두고 배치 쪽 이득을 먼저 취한다.
+        MPS(M4 Pro / 0.6B)에서 실측한 결과 기본 ON이 맞다:
+          OFF  RTF 0.52, 0.53                 (평균 0.53)
+          ON   RTF 0.82, 0.88, 0.87, 0.85     (평균 0.86) → 1.63배
+        GPU 사용률도 59% → 68%로 올랐다. 걱정했던 재컴파일 폭주는 없었고,
+        inductor가 컴파일 결과를 디스크에 캐시하므로 비용은 머신당 한 번만
+        든다 (앱을 다시 켜도 첫 변환부터 전속력).
+
+        CPU는 재보지 않았으므로 OFF로 둔다.
         worker.torch_compile = True/False 로 언제든 강제할 수 있다."""
         if self.torch_compile is not None:
             return bool(self.torch_compile)
-        return self.device == "cuda"
+        return self.device in ("cuda", "mps")
 
     def _apply_torch_compile(self, torch):
         """자기회귀 디코더를 torch.compile로 감싼다.

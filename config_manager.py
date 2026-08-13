@@ -67,7 +67,9 @@ def get_default_config():
         # 배치는 이득이 없었다 - tts_worker._resolve_batch_size 주석 참고).
         # CUDA에서는 bench_gpu.py로 재보고 이득이 있으면 키울 것.
         "batch_size": None,
-        # torch.compile 사용 여부. null이면 디바이스별 기본값 (CUDA만 ON).
+        # torch.compile 사용 여부. null이면 GPU(CUDA/MPS)에서 ON.
+        # MPS 실측 1.63배 (RTF 0.53 -> 0.86). 컴파일 결과는 디스크에 캐시되어
+        # 비용은 머신당 한 번만 든다. 문제가 생기면 false로 끌 수 있다.
         "torch_compile": None,
     }
 
