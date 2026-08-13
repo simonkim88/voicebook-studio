@@ -169,14 +169,38 @@ def gpu_utilization():
         return None
 
 
+def swap_used_gb():
+    """macOS: 지금 쓰고 있는 스왑(GB). 실패하면 None.
+
+    맥에서 '조용히 느려지는' 경로는 Windows 의 sysmem fallback 과 이름만
+    다르다. 통합메모리가 모자라면 OOM 이 아니라 압축·스왑으로 넘어가고,
+    예외가 없으니 _generate_batch 의 재귀 이등분도 돌지 않는다. 측정 중에
+    스왑이 늘었다면 그 행은 느린 경로가 섞인 값이다."""
+    try:
+        out = subprocess.run(["sysctl", "-n", "vm.swapusage"],
+                             capture_output=True, text=True, timeout=5).stdout
+        m = re.search(r"used\s*=\s*([\d.]+)([MG])", out)
+        if not m:
+            return None
+        v = float(m.group(1))
+        return v / 1024 if m.group(2) == "M" else v
+    except Exception:
+        return None
+
+
 class GpuSampler:
     """측정 구간 동안 백그라운드에서 GPU 사용률을 계속 찍는다.
 
     청크 사이에만 재면 생성이 끝난 직후(=유휴)만 잡혀 실제보다 낮게 나온다."""
 
-    def __init__(self, interval=0.2):
+    def __init__(self, interval=0.2, sample_mps_memory=False):
         self.interval = interval
         self.samples = []
+        # MPS 에는 CUDA 의 max_memory_allocated / reset_peak_memory_stats 에
+        # 해당하는 API 가 없다. 그래서 피크를 여기서 직접 표집한다 — 어차피
+        # 사용률 때문에 0.2초마다 깨어나므로 추가 비용이 거의 없다.
+        self.sample_mps_memory = sample_mps_memory
+        self.mem_samples = []
         self._stop = threading.Event()
         self._thread = None
 
@@ -190,7 +214,19 @@ class GpuSampler:
             u = gpu_utilization()
             if u is not None:
                 self.samples.append(u)
+            if self.sample_mps_memory:
+                try:
+                    import torch
+                    # driver_allocated_memory 는 드라이버가 실제로 잡은 양이라
+                    # current_allocated_memory(텐서 합)보다 실점유에 가깝다.
+                    self.mem_samples.append(torch.mps.driver_allocated_memory())
+                except Exception:
+                    pass
             self._stop.wait(self.interval)
+
+    @property
+    def mem_peak_gb(self):
+        return max(self.mem_samples) / 2**30 if self.mem_samples else float("nan")
 
     def __exit__(self, *exc):
         self._stop.set()
@@ -277,10 +313,24 @@ def main():
         print(f"GPU 메모리: {vram_total:.2f} GiB "
               f"— 이 값을 넘는 행은 시스템 RAM 으로 샌 것이라 비교에 쓸 수 없다\n")
 
+    # 맥도 같은 함정이 있다. recommended_max_memory 는 하드 한도가 아니라
+    # 소프트 경계라, 넘어도 OOM 이 아니라 압축·스왑으로 조용히 느려진다.
+    # (실제로 91분 변환 뒤 앱이 40.6GB 를 물고 스왑 12.3GB 까지 간 적이 있다.)
+    # 통합메모리는 다른 앱과 공유하므로 이 한도는 '나 혼자 쓸 때'의 값이다.
+    is_mps = device == "mps"
+    mps_limit = torch.mps.recommended_max_memory() / 2**30 if is_mps else None
+    if is_mps:
+        print(f"MPS 권장 최대: {mps_limit:.1f} GiB (통합메모리 공유) "
+              f"— 넘으면 오류 없이 압축·스왑으로 느려진다")
+        print(f"측정 시작 시점 스왑: {swap_used_gb() or 0:.2f} GiB "
+              f"— 회차 중 스왑이 늘면 그 행은 무효다\n")
+
+    mem_col = " " * 0
     print(f"{'batch':>6} {'chars':>6} {'실효':>5} {'회':>3} {'생성 오디오':>12} "
           f"{'걸린 시간':>10} {'RTF':>7} {'GPU평균':>7} {'GPU최대':>7}"
-          + (f" {'VRAM':>8}" if is_cuda else ""))
-    print("-" * (76 + (9 if is_cuda else 0)))
+          + (f" {'VRAM':>8}" if is_cuda else "")
+          + (f" {'MPS메모리':>10} {'스왑Δ':>7}" if is_mps else ""))
+    print("-" * (76 + (9 if is_cuda else 0) + (19 if is_mps else 0)))
 
     # 모델은 한 번만 올리고 배치 크기만 바꿔 가며 잰다 (로딩이 측정보다 오래 걸린다).
     # torch.compile은 모델을 제자리에서 바꾸므로 한 번만 적용한다.
@@ -331,11 +381,13 @@ def main():
             samples = 0
             if is_cuda:
                 torch.cuda.reset_peak_memory_stats()
-            with GpuSampler() as sampler:
+            swap_before = swap_used_gb() if is_mps else None
+            with GpuSampler(sample_mps_memory=is_mps) as sampler:
                 t0 = time.time()
                 for _, wav, sr, _ in worker._iter_generated(torch, texts):
                     samples += len(wav)
                 elapsed = time.time() - t0
+            swap_after = swap_used_gb() if is_mps else None
 
             audio_sec = samples / sr
             rtf = audio_sec / elapsed if elapsed else 0
@@ -345,13 +397,33 @@ def main():
             if spilled:
                 spilled_keys.add((batch_size, chars))
             vram = f" {peak:>6.2f}G{'!' if spilled else ' '}" if is_cuda else ""
+
+            # MPS: 피크 점유와 스왑 증가분. 스왑이 늘었으면 CUDA 의 sysmem
+            # fallback 과 같은 이유로 그 행은 비교에 못 쓴다.
+            mps_cols, swapped = "", False
+            if is_mps:
+                mem_peak = sampler.mem_peak_gb
+                swap_delta = ((swap_after - swap_before)
+                              if swap_before is not None and swap_after is not None
+                              else float("nan"))
+                swapped = swap_delta == swap_delta and swap_delta > 0.05
+                over = mem_peak == mem_peak and mem_peak > mps_limit
+                if swapped or over:
+                    spilled_keys.add((batch_size, chars))
+                mps_cols = (f" {mem_peak:>8.2f}G{'!' if over else ' '}"
+                            f" {swap_delta:>+6.2f}G{'!' if swapped else ' '}")
+
             print(f"{batch_size:>6} {chars:>6} {eff:>5.1f} {rep+1:>3} "
                   f"{audio_sec:>10.1f}초 {elapsed:>9.1f}초 "
-                  f"{rtf:>7.2f} {sampler.mean:>5.0f}% {sampler.peak:>5.0f}%{vram}",
+                  f"{rtf:>7.2f} {sampler.mean:>5.0f}% {sampler.peak:>5.0f}%"
+                  f"{vram}{mps_cols}",
                   flush=True)
             if spilled:
                 print(f"    ⚠️  VRAM {vram_total:.2f}G 초과 — 시스템 RAM 으로 샜다. "
                       f"이 행은 배치 설정 비교에 쓸 수 없다", flush=True)
+            if is_mps and swapped:
+                print(f"    ⚠️  측정 중 스왑이 {swap_delta:+.2f}G 늘었다 — 압축·스왑 "
+                      f"경로가 섞였다. 이 행은 비교에 쓸 수 없다", flush=True)
 
             worker._free_device_memory(torch)
 

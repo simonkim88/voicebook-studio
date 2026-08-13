@@ -15,3 +15,6 @@ nohup.out
 # 로컬 전용 (커밋 금지)
 telegram_config.json
 batch_input/
+
+# 로컬 조사용 로그/재현 스크립트 (기계별로 다르고 공유 가치 없음)
+.bench_evidence/
