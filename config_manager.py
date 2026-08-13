@@ -63,9 +63,9 @@ def get_default_config():
         "model_size": "1.7B",  # 1.7B 또는 0.6B
         "tts_engine": "qwen",  # qwen 또는 kokoro
         "output_format": "audio",  # audio 또는 audio_srt
-        # 청크 몇 개를 한 번의 generate로 묶을지. null이면 디바이스별 기본값
-        # (GPU 4 / CPU 1). 자기회귀 디코딩은 커널 런치에 묶여 있어 배치를
-        # 키우면 GPU 유휴 시간이 줄어든다. VRAM/통합메모리가 넉넉하면 8까지.
+        # 청크 몇 개를 한 번의 generate로 묶을지. null이면 1 (MPS 실측 결과
+        # 배치는 이득이 없었다 - tts_worker._resolve_batch_size 주석 참고).
+        # CUDA에서는 bench_gpu.py로 재보고 이득이 있으면 키울 것.
         "batch_size": None,
         # torch.compile 사용 여부. null이면 디바이스별 기본값 (CUDA만 ON).
         "torch_compile": None,

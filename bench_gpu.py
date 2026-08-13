@@ -121,10 +121,10 @@ def main():
                     help="torch.compile을 켜고 측정 (첫 배치는 컴파일 때문에 느림)")
     ap.add_argument("--chunks", type=int, default=8,
                     help="한 번의 측정에 쓸 청크 수 (기본: 8)")
-    ap.add_argument("--sample", action="store_true",
-                    help="실제 변환과 같은 확률적 샘플링으로 측정. 같은 입력도 "
-                         "매번 길이가 30%%씩 달라져 배치 간 비교는 불가능하다. "
-                         "기본은 그리디(재현 가능)")
+    ap.add_argument("--reps", type=int, default=2,
+                    help="배치 크기마다 반복 측정할 횟수 (기본: 2). 반복 간 "
+                         "편차가 곧 이 측정의 잡음 폭이고, 배치 간 차이가 "
+                         "그보다 커야 의미가 있다")
     args = ap.parse_args()
 
     import torch
@@ -134,25 +134,22 @@ def main():
     texts = [SAMPLE_TEXTS[i % len(SAMPLE_TEXTS)] for i in range(args.chunks)]
 
     print(f"디바이스: {device} | 모델: {cfg.get('model_size')} | "
-          f"torch.compile: {'ON' if args.compile else 'OFF'} | "
-          f"디코딩: {'샘플링' if args.sample else '그리디(재현 가능)'}")
-    print(f"청크 {len(texts)}개로 배치 크기 {args.batch} 비교")
-    if not args.sample:
-        print("→ '생성 오디오' 열이 행마다 같아야 정상. 다르면 비교가 무효다.\n")
-    else:
-        print("→ 주의: 샘플링 모드는 회당 편차가 커서 배치 간 비교에 못 쓴다.\n")
+          f"torch.compile: {'ON' if args.compile else 'OFF'}")
+    print(f"청크 {len(texts)}개 × {args.reps}회 반복으로 배치 크기 {args.batch} 비교")
+    print("→ 실제 변환과 같은 확률적 샘플링으로 잰다. RTF는 생성 길이에 둔감해서"
+          " (같은 문장을 10.8초/163.6초로 뽑아도 0.53/0.51) 길이가 달라도 비교된다.\n")
 
-    print(f"{'batch':>6} {'생성 오디오':>12} {'걸린 시간':>10} {'RTF':>7} "
+    print(f"{'batch':>6} {'회':>3} {'생성 오디오':>12} {'걸린 시간':>10} {'RTF':>7} "
           f"{'GPU평균':>7} {'GPU최대':>7}")
-    print("-" * 58)
+    print("-" * 62)
 
     # 모델은 한 번만 올리고 배치 크기만 바꿔 가며 잰다 (로딩이 측정보다 오래 걸린다).
     # torch.compile은 모델을 제자리에서 바꾸므로 한 번만 적용한다.
+    #
+    # 디코딩은 반드시 기본값(샘플링)을 쓴다. do_sample=False로 고정하면 재현은
+    # 되지만 EOS를 못 만나고 max_new_tokens까지 돌아버린다 (한 문장이 10.8초
+    # 대신 163.6초로 나왔다). 실제와 다른 작업을 재게 되므로 쓸 수 없다.
     worker = build_worker(device, cfg, args.batch[0], args.compile)
-    if not args.sample:
-        # 그리디 디코딩: 같은 입력 → 항상 같은 토큰 수. 이래야 배치 크기별
-        # RTF를 비교할 수 있다 (샘플링을 켜면 회당 편차가 배치 간 차이보다 크다).
-        worker.generate_overrides = {"do_sample": False, "subtalker_dosample": False}
     print("모델 로딩 중...")
     worker._load_qwen(torch)
     if args.compile:
@@ -162,52 +159,63 @@ def main():
     print("워밍업 중...\n")
     worker._generate_with_retry(torch, texts[:1])
 
-    results = []
+    rtfs = {}   # batch_size -> [RTF, ...]
     for batch_size in args.batch:
         worker.batch_size = batch_size
+        rtfs[batch_size] = []
 
-        samples = 0
-        with GpuSampler() as sampler:
-            t0 = time.time()
-            for _, _, wav, sr, _ in worker._iter_synthesized(torch, texts):
-                samples += len(wav)
-            elapsed = time.time() - t0
+        for rep in range(args.reps):
+            samples = 0
+            with GpuSampler() as sampler:
+                t0 = time.time()
+                for _, _, wav, sr, _ in worker._iter_synthesized(torch, texts):
+                    samples += len(wav)
+                elapsed = time.time() - t0
 
-        audio_sec = samples / sr
-        rtf = audio_sec / elapsed if elapsed else 0
-        results.append((batch_size, rtf, audio_sec))
-        print(f"{batch_size:>6} {audio_sec:>10.1f}초 {elapsed:>9.1f}초 "
-              f"{rtf:>7.2f} {sampler.mean:>5.0f}% {sampler.peak:>5.0f}%", flush=True)
+            audio_sec = samples / sr
+            rtf = audio_sec / elapsed if elapsed else 0
+            rtfs[batch_size].append(rtf)
+            print(f"{batch_size:>6} {rep+1:>3} {audio_sec:>10.1f}초 {elapsed:>9.1f}초 "
+                  f"{rtf:>7.2f} {sampler.mean:>5.0f}% {sampler.peak:>5.0f}%", flush=True)
 
-        worker._free_device_memory(torch)
+            worker._free_device_memory(torch)
+
+    worker._release_model()
 
     print()
 
-    # 비교가 성립하는지부터 확인한다. 생성한 오디오 길이가 행마다 다르면
-    # 서로 다른 작업량을 잰 것이라 RTF를 나란히 놓을 수 없다.
-    audio_lengths = [r[2] for r in results]
-    spread = (max(audio_lengths) - min(audio_lengths)) / min(audio_lengths) if audio_lengths else 0
-    if spread > 0.02:
-        print(f"⚠️  경고: 행마다 생성한 오디오 길이가 {spread:.0%} 차이 난다 "
-              f"({min(audio_lengths):.1f}~{max(audio_lengths):.1f}초).")
-        print("    작업량이 달라 RTF 비교가 무효다. --sample 없이 다시 측정할 것.")
+    means = {b: sum(v) / len(v) for b, v in rtfs.items()}
+    print(f"{'batch':>6} {'평균 RTF':>10} {'최소~최대':>16}")
+    for b in args.batch:
+        v = rtfs[b]
+        print(f"{b:>6} {means[b]:>10.2f} {min(v):>7.2f} ~ {max(v):<7.2f}")
+
+    # 같은 설정을 반복했을 때의 편차가 이 측정의 잡음 폭이다.
+    # 배치 간 차이가 그보다 작으면 아무것도 주장할 수 없다.
+    noise = max((max(v) - min(v)) / (sum(v) / len(v)) for v in rtfs.values() if len(v) > 1) \
+        if args.reps > 1 else None
+
+    best_batch = max(means, key=means.get)
+    baseline = means.get(1)
+    gain = means[best_batch] / baseline if baseline else None
+    print()
+
+    if noise is not None:
+        print(f"측정 잡음 폭(같은 설정 반복 시): {noise:.1%}")
+    if gain is None:
+        print("batch_size=1을 함께 재지 않아 비교 기준이 없다.")
         return
 
-    best_batch, best_rtf, _ = max(results, key=lambda r: r[1])
-    baseline = {r[0]: r[1] for r in results}.get(1)
-    gain = best_rtf / baseline if baseline else None
-
-    print(f"가장 빠른 설정: batch_size={best_batch} (RTF {best_rtf:.2f})")
-    if gain:
-        print(f"batch_size=1 대비 {gain:.2f}배")
-    # 측정 잡음을 고려해 이득이 뚜렷할 때만 변경을 권한다.
-    if gain is not None and gain < 1.05:
-        print("\n→ 배치별 차이가 5% 미만이라 잡음과 구분되지 않는다. "
-              'batch_size는 1로 두는 것이 낫다.')
+    print(f"가장 빠른 설정: batch_size={best_batch}, batch_size=1 대비 {gain:.2f}배")
+    if noise is not None and (gain - 1) <= noise:
+        print(f"\n→ 배치 간 차이({gain-1:+.1%})가 잡음 폭({noise:.1%})을 넘지 못한다. "
+              "배치가 이득이라는 증거가 없으므로")
+        print('  config.json에 "batch_size": 1 로 두는 것이 맞다.')
     else:
-        print(f'\nconfig.json에 반영: "batch_size": {best_batch}')
+        print(f'\n→ 잡음 폭을 넘는 실제 이득이다. config.json에 '
+              f'"batch_size": {best_batch}')
     if args.compile:
-        print("torch.compile을 끈 실행과 이 결과를 비교해 "
+        print("\ntorch.compile을 끈 실행과 이 결과를 비교해 "
               '"torch_compile" 값을 정할 것.')
 
 

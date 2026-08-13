@@ -364,9 +364,15 @@ class TTSWorker(QThread):
             return 1  # KPipeline에는 배치 API가 없다
         if self.batch_size:
             return max(1, int(self.batch_size))
-        # GPU에서는 배치를 키울수록 커널 런치/인코딩 비용이 분산된다.
-        # CPU는 배치를 키워봐야 연산량만 비례해 늘어 이득이 없다.
-        return 4 if self.device in ("mps", "cuda") else 1
+        # 기본값 1. MPS(M4 Pro)에서 실측한 결과 배치는 이득이 없었다:
+        #   batch=1 → RTF 0.52~0.53 (편차 2%)
+        #   batch=2 → RTF 0.50~0.50 (편차 0%,  -4.8%)
+        #   batch=4 → RTF 0.47~0.66 (편차 34%)
+        # 배치는 그 안에서 가장 긴 시퀀스가 끝날 때까지 돌기 때문에, 청크 길이가
+        # 들쭉날쭉하면 짧은 청크가 남는 스텝을 헛돈다. batch=4가 빠를 때도 있고
+        # (0.66) 느릴 때도 있는(0.47) 이유가 이것이고, 평균이 조금 높아도 소요
+        # 시간을 예측할 수 없게 만든다. CUDA에서 따로 재기 전까지는 1을 쓴다.
+        return 1
 
     def _synthesize_qwen(self, texts):
         """청크 리스트를 한 번의 generate로 합성 → (wavs, sample_rate).
