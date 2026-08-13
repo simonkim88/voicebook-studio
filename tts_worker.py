@@ -93,6 +93,8 @@ class TTSWorker(QThread):
         # 한 배치의 글자 수 예산. VRAM 사용량은 청크 개수가 아니라 총 길이를 따라가므로
         # 개수만 고정하면 긴 청크가 몰릴 때 OOM 이 난다 (500자×6 = 6.6G 확인).
         self.batch_chars = 2000
+        # torch.compile 적용 여부. None 이면 _should_torch_compile() 이 결정.
+        self.torch_compile = None
 
         # SRT 자막(오디오-텍스트 매칭) 출력
         # "none": 만들지 않음 / "per_file": 오디오 파일마다 1개 / "merged": 전체 1개
@@ -140,13 +142,9 @@ class TTSWorker(QThread):
 
             self.progress.emit(10)  # 모델 로딩 완료
 
-            # torch.compile로 추론 최적화 (첫 청크만 약간 느리고 이후 빨라짐)
-            try:
-                if hasattr(self.model, 'llm') and hasattr(torch, 'compile'):
-                    self.status.emit("모델 최적화 중 (torch.compile)...")
-                    self.model.llm = torch.compile(self.model.llm, mode="reduce-overhead")
-            except Exception as e:
-                print(f"[warn] torch.compile 실패, 기본 모드로 진행: {e}")
+            # torch.compile로 추론 최적화 (첫 청크만 느리고 이후 빨라짐)
+            if self.tts_engine != "kokoro":
+                self._apply_torch_compile(torch)
 
             self.status.emit("음성 생성 중...")
             self._run_generation(torch, start_time)
@@ -155,6 +153,12 @@ class TTSWorker(QThread):
             import traceback
             traceback.print_exc()
             self.error.emit(str(e))
+        finally:
+            # 변환이 끝나면 반드시 모델과 디바이스 캐시를 놓아준다.
+            # PyTorch의 MPS/CUDA 캐싱 할당자는 한 번 잡은 버퍼를 OS에 돌려주지
+            # 않으므로, 이걸 빼먹으면 앱이 떠 있는 동안 수십 GB를 계속 쥐고
+            # 있게 된다 (실제로 91분짜리 변환 뒤 40GB를 물고 있었다).
+            self._release_model()
 
     def _load_qwen(self, torch):
         """Qwen3-TTS 모델 로드"""
@@ -196,6 +200,93 @@ class TTSWorker(QThread):
                 dtype=model_dtype,
                 attn_implementation=attn_impl,
             )
+
+    def _should_torch_compile(self):
+        """torch.compile을 적용할지 결정.
+
+        MPS(M4 Pro / 0.6B / B=1)에서 실측한 결과 기본 ON이 맞다:
+          OFF  RTF 0.52, 0.53                 (평균 0.53)
+          ON   RTF 0.82, 0.88, 0.87, 0.85     (평균 0.86) → 1.63배
+        GPU 사용률도 59% → 68%로 올랐다. KV 캐시 길이가 매 스텝 바뀌어
+        재컴파일이 폭주할까 우려했지만 그런 일은 없었고, inductor가 컴파일
+        결과를 디스크에 캐시하므로 비용은 머신당 한 번만 든다.
+
+        CUDA는 배치 경로와 별개로 이득이 기대되지만 아직 재보지 않았다.
+        CPU도 재보지 않았으므로 OFF. worker.torch_compile 로 강제할 수 있다."""
+        if self.torch_compile is not None:
+            return bool(self.torch_compile)
+        return self.device in ("cuda", "mps")
+
+    def _apply_torch_compile(self, torch):
+        """자기회귀 디코더를 torch.compile로 감싼다.
+
+        이전 구현은 `self.model.llm`을 대상으로 삼았는데 qwen_tts에는 그런
+        속성이 없어 조건이 항상 False였다 (= 어떤 플랫폼에서도 컴파일된 적이
+        없음). 실제 핫패스는 Qwen3TTSModel → .model(HF 모델) → .talker 안쪽의
+        디코더 스택이다. talker.forward 자체는 generation_step 같은 파이썬
+        int를 인자로 받아 스텝마다 재컴파일을 유발하므로, 텐서만 받는 안쪽
+        디코더(talker.model / talker.code_predictor.model)만 감싼다."""
+        if not hasattr(torch, "compile") or not self._should_torch_compile():
+            return
+
+        # reduce-overhead는 CUDA graphs 기반이라 CUDA에서만 의미가 있다.
+        mode = "reduce-overhead" if self.device == "cuda" else "default"
+
+        talker = getattr(getattr(self.model, "model", None), "talker", None)
+        if talker is None:
+            print("[warn] talker를 찾지 못해 torch.compile을 건너뜁니다.")
+            return
+
+        targets = [talker]
+        code_predictor = getattr(talker, "code_predictor", None)
+        if code_predictor is not None:
+            targets.append(code_predictor)
+
+        compiled = []
+        for owner in targets:
+            module = getattr(owner, "model", None)
+            if module is None:
+                continue
+            try:
+                owner.model = torch.compile(module, mode=mode)
+                compiled.append(f"{type(owner).__name__}.model")
+            except Exception as e:
+                print(f"[warn] torch.compile 실패, 기본 모드로 진행: {e}")
+
+        if compiled:
+            self.status.emit(f"모델 최적화 적용 (torch.compile, mode={mode})")
+            print(f"[info] torch.compile 적용: {', '.join(compiled)} (mode={mode})")
+        else:
+            print("[warn] torch.compile 대상을 찾지 못했습니다.")
+
+    def _free_device_memory(self, torch):
+        """디바이스 캐시 정리. CUDA와 MPS는 API가 서로 다르다."""
+        import gc
+        if self.device == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        elif self.device == "mps" and torch.backends.mps.is_available():
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
+        gc.collect()
+
+    def _release_model(self):
+        """모델 참조를 끊고 디바이스 캐시를 비운다 (변환 종료 시 항상 호출).
+
+        워커는 변환마다 새로 만들어지지만 앱이 이전 워커를 self.tts_worker로
+        붙들고 있어, 여기서 놓아주지 않으면 모델과 GPU 버퍼 풀이 다음 변환
+        때까지 그대로 남는다."""
+        try:
+            import torch
+        except ImportError:
+            return
+        self.model = None
+        self.kokoro_pipeline = None
+        self.voice_clone_prompt = None
+        try:
+            self._free_device_memory(torch)
+        except Exception as e:
+            print(f"[warn] 디바이스 메모리 정리 실패: {e}")
 
     def _load_kokoro(self):
         """Kokoro-82M 파이프라인 로드 (최초 1회 모델 자동 다운로드)"""
