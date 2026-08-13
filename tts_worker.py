@@ -259,11 +259,20 @@ class TTSWorker(QThread):
         재컴파일이 폭주할까 우려했지만 그런 일은 없었고, inductor가 컴파일
         결과를 디스크에 캐시하므로 비용은 머신당 한 번만 든다.
 
-        CUDA는 배치 경로와 별개로 이득이 기대되지만 아직 재보지 않았다.
-        CPU도 재보지 않았으므로 OFF. worker.torch_compile 로 강제할 수 있다."""
+        CUDA(RTX 4060 Ti / 0.6B / 청크 8개)에서는 실측 결과 이득이 없어 OFF다:
+          B=1  OFF 0.61, 0.61   ON 0.61, 0.61        → 차이 없음 (잡음 폭 1%)
+          B=8  OFF 4.28         ON 3.99              → -7% (잡음 폭 3.5%)
+        배치가 이미 7.0배(0.61 → 4.28)를 가져갔고 그 위에 컴파일을 얹으면
+        오히려 느려진다. MPS 에서 이득이 났던 이유는 CPU 가 Metal 커널을
+        하나씩 인코딩하는 디스패치 병목이었는데, CUDA 에는 그 병목이 없다
+        (배치로 7배가 회수된 것이 그 증거다). 게다가 CUDA 쪽에서 컴파일이
+        쓸 수 있는 가장 큰 카드인 reduce-overhead(CUDA graphs)는
+        _torch_compile_mode() 의 이유로 막혀 있다.
+
+        CPU 는 재보지 않았으므로 OFF. worker.torch_compile 로 강제할 수 있다."""
         if self.torch_compile is not None:
             return bool(self.torch_compile)
-        return self.device in ("cuda", "mps")
+        return self.device == "mps"
 
     def _torch_compile_mode(self):
         """torch.compile 에 넘길 mode. worker.torch_compile_mode 로 덮어쓸 수 있다.
