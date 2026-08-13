@@ -141,6 +141,12 @@ class TTSWorker(QThread):
             import traceback
             traceback.print_exc()
             self.error.emit(str(e))
+        finally:
+            # 변환이 끝나면 반드시 모델과 디바이스 캐시를 놓아준다.
+            # PyTorch의 MPS/CUDA 캐싱 할당자는 한 번 잡은 버퍼를 OS에 돌려주지
+            # 않으므로, 이걸 빼먹으면 앱이 떠 있는 동안 수십 GB를 계속 쥐고
+            # 있게 된다 (실제로 91분짜리 변환 뒤 40GB를 물고 있었다).
+            self._release_model()
 
     def _load_qwen(self, torch):
         """Qwen3-TTS 모델 로드"""
@@ -397,6 +403,24 @@ class TTSWorker(QThread):
         """재시도해 볼 만한 디바이스/메모리 오류인지 판정 (CUDA·MPS 공통)."""
         msg = str(err).lower()
         return any(k in msg for k in ("cuda", "mps", "metal", "out of memory"))
+
+    def _release_model(self):
+        """모델 참조를 끊고 디바이스 캐시를 비운다 (변환 종료 시 항상 호출).
+
+        워커는 변환마다 새로 만들어지지만 앱이 이전 워커를 self.tts_worker로
+        붙들고 있어, 여기서 놓아주지 않으면 모델과 MPS 버퍼 풀이 다음 변환
+        때까지 그대로 남는다."""
+        try:
+            import torch
+        except ImportError:
+            return
+        self.model = None
+        self.kokoro_pipeline = None
+        self.voice_clone_prompt = None
+        try:
+            self._free_device_memory(torch)
+        except Exception as e:
+            print(f"[warn] 디바이스 메모리 정리 실패: {e}")
 
     def _free_device_memory(self, torch):
         """디바이스 캐시 정리. CUDA와 MPS는 API가 서로 다르다."""
