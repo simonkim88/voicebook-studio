@@ -43,22 +43,57 @@ SAMPLE_TEXTS = [
 ]
 
 
-def gpu_utilization():
-    """macOS 한정: 현재 GPU 사용률(%) 샘플 1개. 실패하면 None.
+def _gpu_utilization_macos():
+    """macOS: ioreg로 GPU 사용률(%) 샘플 1개.
 
     ioreg는 한 줄에 키를 여러 개 붙여 내보내므로 정규식으로 뽑아야 한다
     (split('=')[1]로 자르면 뒤 키까지 딸려와 int 변환에 실패한다)."""
+    out = subprocess.run(
+        ["ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"],
+        capture_output=True, text=True, timeout=5,
+    ).stdout
+    m = re.search(r'"Device Utilization %"=(\d+)', out)
+    return int(m.group(1)) if m else None
+
+
+def _gpu_utilization_nvidia():
+    """NVIDIA: nvidia-smi로 GPU 사용률(%) 샘플 1개.
+
+    ioreg와 달리 프로세스 기동이 비싸(~30ms) 샘플 간격을 너무 좁히면
+    측정 자체가 CPU를 잡아먹는다. 기본 0.2초면 무해한 수준이다."""
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=utilization.gpu",
+         "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=5,
+    ).stdout.strip().splitlines()
+    return int(out[0].strip()) if out else None
+
+
+# 플랫폼별 샘플러를 한 번만 정해 두고 재사용한다 (매 샘플마다 탐색하지 않도록).
+_UTIL_BACKEND = "unknown"
+
+
+def gpu_utilization():
+    """현재 GPU 사용률(%) 샘플 1개. 잴 수 없으면 None."""
+    global _UTIL_BACKEND
+    if _UTIL_BACKEND == "unknown":
+        for name, fn in (("nvidia", _gpu_utilization_nvidia),
+                         ("macos", _gpu_utilization_macos)):
+            try:
+                if fn() is not None:
+                    _UTIL_BACKEND = name
+                    break
+            except Exception:
+                continue
+        else:
+            _UTIL_BACKEND = "none"
+    if _UTIL_BACKEND == "none":
+        return None
     try:
-        out = subprocess.run(
-            ["ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout
-        m = re.search(r'"Device Utilization %"=(\d+)', out)
-        if m:
-            return int(m.group(1))
+        return (_gpu_utilization_nvidia if _UTIL_BACKEND == "nvidia"
+                else _gpu_utilization_macos)()
     except Exception:
-        pass
-    return None
+        return None
 
 
 class GpuSampler:
@@ -97,7 +132,7 @@ class GpuSampler:
         return max(self.samples) if self.samples else float("nan")
 
 
-def build_worker(device, cfg, batch_size, use_compile):
+def build_worker(device, cfg, batch_size, use_compile, compile_mode=None):
     """모델 로딩 로직을 재사용하려고 TTSWorker를 그대로 쓴다 (스레드는 안 띄움)."""
     from tts_worker import TTSWorker
 
@@ -110,6 +145,7 @@ def build_worker(device, cfg, batch_size, use_compile):
     )
     worker.batch_size = batch_size
     worker.torch_compile = use_compile
+    worker.torch_compile_mode = compile_mode
     return worker
 
 
@@ -119,6 +155,9 @@ def main():
                     help="비교할 배치 크기 (기본: 1 2 4 8)")
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile을 켜고 측정 (첫 배치는 컴파일 때문에 느림)")
+    ap.add_argument("--mode", default=None,
+                    help="torch.compile의 mode (default / reduce-overhead / "
+                         "max-autotune). 생략하면 워커 기본값")
     ap.add_argument("--chunks", type=int, default=8,
                     help="한 번의 측정에 쓸 청크 수 (기본: 8)")
     ap.add_argument("--reps", type=int, default=2,
@@ -133,15 +172,17 @@ def main():
     device = get_device(cfg)
     texts = [SAMPLE_TEXTS[i % len(SAMPLE_TEXTS)] for i in range(args.chunks)]
 
+    compile_label = f"ON (mode={args.mode or '기본값'})" if args.compile else "OFF"
     print(f"디바이스: {device} | 모델: {cfg.get('model_size')} | "
-          f"torch.compile: {'ON' if args.compile else 'OFF'}")
+          f"torch.compile: {compile_label}")
     print(f"청크 {len(texts)}개 × {args.reps}회 반복으로 배치 크기 {args.batch} 비교")
     print("→ 실제 변환과 같은 확률적 샘플링으로 잰다. RTF는 생성 길이에 둔감해서"
           " (같은 문장을 10.8초/163.6초로 뽑아도 0.53/0.51) 길이가 달라도 비교된다.\n")
 
+    is_cuda = device == "cuda"
     print(f"{'batch':>6} {'회':>3} {'생성 오디오':>12} {'걸린 시간':>10} {'RTF':>7} "
-          f"{'GPU평균':>7} {'GPU최대':>7}")
-    print("-" * 62)
+          f"{'GPU평균':>7} {'GPU최대':>7}" + (f" {'VRAM':>8}" if is_cuda else ""))
+    print("-" * (62 + (9 if is_cuda else 0)))
 
     # 모델은 한 번만 올리고 배치 크기만 바꿔 가며 잰다 (로딩이 측정보다 오래 걸린다).
     # torch.compile은 모델을 제자리에서 바꾸므로 한 번만 적용한다.
@@ -149,7 +190,7 @@ def main():
     # 디코딩은 반드시 기본값(샘플링)을 쓴다. do_sample=False로 고정하면 재현은
     # 되지만 EOS를 못 만나고 max_new_tokens까지 돌아버린다 (한 문장이 10.8초
     # 대신 163.6초로 나왔다). 실제와 다른 작업을 재게 되므로 쓸 수 없다.
-    worker = build_worker(device, cfg, args.batch[0], args.compile)
+    worker = build_worker(device, cfg, args.batch[0], args.compile, args.mode)
     print("모델 로딩 중...")
     worker._load_qwen(torch)
     if args.compile:
@@ -166,6 +207,8 @@ def main():
 
         for rep in range(args.reps):
             samples = 0
+            if is_cuda:
+                torch.cuda.reset_peak_memory_stats()
             with GpuSampler() as sampler:
                 t0 = time.time()
                 for _, wav, sr, _ in worker._iter_generated(torch, texts):
@@ -175,8 +218,11 @@ def main():
             audio_sec = samples / sr
             rtf = audio_sec / elapsed if elapsed else 0
             rtfs[batch_size].append(rtf)
+            vram = (f" {torch.cuda.max_memory_allocated()/2**30:>6.2f}G"
+                    if is_cuda else "")
             print(f"{batch_size:>6} {rep+1:>3} {audio_sec:>10.1f}초 {elapsed:>9.1f}초 "
-                  f"{rtf:>7.2f} {sampler.mean:>5.0f}% {sampler.peak:>5.0f}%", flush=True)
+                  f"{rtf:>7.2f} {sampler.mean:>5.0f}% {sampler.peak:>5.0f}%{vram}",
+                  flush=True)
 
             worker._free_device_memory(torch)
 
