@@ -72,6 +72,18 @@ class TTSWorker(QThread):
         # 전체를 메모리에 쌓지 않고 디스크로 스트리밍 저장한다.
         self.split_audio = True
 
+        # --- GPU 활용 튜닝 -------------------------------------------------
+        # Qwen3-TTS의 자기회귀 디코딩은 연산량이 아니라 커널 런치/인코딩에
+        # 묶여 있다 (batch=1이면 GPU가 대부분 유휴 상태로 논다). 청크 여러
+        # 개를 한 번의 generate로 묶으면 그 오버헤드가 분산돼 스루풋이 오른다.
+        # None이면 _resolve_batch_size()가 디바이스별 기본값을 고른다.
+        self.batch_size = None
+        # torch.compile 적용 여부. None이면 디바이스별 기본값.
+        self.torch_compile = None
+        # generate()에 덧씌울 파라미터 (do_sample, temperature, top_k 등).
+        # 비워 두면 qwen_tts의 generate_config.json 기본값을 그대로 쓴다.
+        self.generate_overrides = None
+
         # SRT 자막(오디오-텍스트 매칭) 출력
         # "none": 만들지 않음 / "per_file": 오디오 파일마다 1개 / "merged": 전체 1개
         self.srt_mode = srt_mode if srt_mode in ("none", "per_file", "merged") else "none"
@@ -118,13 +130,9 @@ class TTSWorker(QThread):
 
             self.progress.emit(10)  # 모델 로딩 완료
 
-            # torch.compile로 추론 최적화 (첫 청크만 약간 느리고 이후 빨라짐)
-            try:
-                if hasattr(self.model, 'llm') and hasattr(torch, 'compile'):
-                    self.status.emit("모델 최적화 중 (torch.compile)...")
-                    self.model.llm = torch.compile(self.model.llm, mode="reduce-overhead")
-            except Exception as e:
-                print(f"[warn] torch.compile 실패, 기본 모드로 진행: {e}")
+            # torch.compile로 추론 최적화 (첫 청크만 느리고 이후 빨라짐)
+            if self.tts_engine != "kokoro":
+                self._apply_torch_compile(torch)
 
             self.status.emit("음성 생성 중...")
             self._run_generation(torch, start_time)
@@ -174,6 +182,60 @@ class TTSWorker(QThread):
                 dtype=model_dtype,
                 attn_implementation=attn_impl,
             )
+
+    def _should_torch_compile(self):
+        """torch.compile을 적용할지 결정.
+
+        CUDA는 reduce-overhead(CUDA graphs) + flash-attn 조합으로 이득이
+        분명해 기본 ON. MPS는 inductor가 Metal 셰이더를 만들어 주긴 하지만
+        KV 캐시 길이가 매 스텝 바뀌어 재컴파일이 잦을 수 있으므로, 벤치마크로
+        확인하기 전까지는 기본 OFF로 두고 배치 쪽 이득을 먼저 취한다.
+        worker.torch_compile = True/False 로 언제든 강제할 수 있다."""
+        if self.torch_compile is not None:
+            return bool(self.torch_compile)
+        return self.device == "cuda"
+
+    def _apply_torch_compile(self, torch):
+        """자기회귀 디코더를 torch.compile로 감싼다.
+
+        이전 구현은 `self.model.llm`을 대상으로 삼았는데 qwen_tts에는 그런
+        속성이 없어 조건이 항상 False였다 (= 어떤 플랫폼에서도 컴파일된 적이
+        없음). 실제 핫패스는 Qwen3TTSModel → .model(HF 모델) → .talker 안쪽의
+        디코더 스택이다. talker.forward 자체는 generation_step 같은 파이썬
+        int를 인자로 받아 스텝마다 재컴파일을 유발하므로, 텐서만 받는 안쪽
+        디코더(talker.model / talker.code_predictor.model)만 감싼다."""
+        if not hasattr(torch, "compile") or not self._should_torch_compile():
+            return
+
+        # reduce-overhead는 CUDA graphs 기반이라 CUDA에서만 의미가 있다.
+        mode = "reduce-overhead" if self.device == "cuda" else "default"
+
+        talker = getattr(getattr(self.model, "model", None), "talker", None)
+        if talker is None:
+            print("[warn] talker를 찾지 못해 torch.compile을 건너뜁니다.")
+            return
+
+        targets = [talker]
+        code_predictor = getattr(talker, "code_predictor", None)
+        if code_predictor is not None:
+            targets.append(code_predictor)
+
+        compiled = []
+        for owner in targets:
+            module = getattr(owner, "model", None)
+            if module is None:
+                continue
+            try:
+                owner.model = torch.compile(module, mode=mode)
+                compiled.append(f"{type(owner).__name__}.model")
+            except Exception as e:
+                print(f"[warn] torch.compile 실패, 기본 모드로 진행: {e}")
+
+        if compiled:
+            self.status.emit(f"모델 최적화 적용 (torch.compile, mode={mode})")
+            print(f"[info] torch.compile 적용: {', '.join(compiled)} (mode={mode})")
+        else:
+            print("[warn] torch.compile 대상을 찾지 못했습니다.")
 
     def _load_kokoro(self):
         """Kokoro-82M 파이프라인 로드 (최초 1회 모델 자동 다운로드)"""
@@ -290,10 +352,129 @@ class TTSWorker(QThread):
             self.srt_files.append(srt_path)
         return srt_path
 
+    def _resolve_batch_size(self):
+        """한 번의 generate에 묶을 청크 수."""
+        if self.tts_engine == "kokoro":
+            return 1  # KPipeline에는 배치 API가 없다
+        if self.batch_size:
+            return max(1, int(self.batch_size))
+        # GPU에서는 배치를 키울수록 커널 런치/인코딩 비용이 분산된다.
+        # CPU는 배치를 키워봐야 연산량만 비례해 늘어 이득이 없다.
+        return 4 if self.device in ("mps", "cuda") else 1
+
+    def _synthesize_qwen(self, texts):
+        """청크 리스트를 한 번의 generate로 합성 → (wavs, sample_rate).
+
+        qwen_tts의 generate_* API는 text를 list로 받으면 배치로 디코딩하고
+        입력 순서 그대로 List[np.ndarray]를 돌려준다. language/speaker/instruct
+        는 길이 1이면 배치 크기에 맞춰 자동으로 복제된다."""
+        # 기본값은 do_sample=True(temperature 0.9)라 같은 문장도 매번 길이가
+        # 달라진다. 벤치마크처럼 재현 가능한 실행이 필요하면
+        # generate_overrides={"do_sample": False}로 고정할 수 있다.
+        gen_kwargs = dict(self.generate_overrides or {})
+        gen_kwargs.setdefault("max_new_tokens", 2048)
+
+        if self.is_custom_voice:
+            from document_parser import CUSTOM_VOICE_PRESETS
+            voice_info = CUSTOM_VOICE_PRESETS.get(self.voice, {})
+            language = voice_info.get("language", "Korean")
+            return self.model.generate_voice_clone(
+                text=texts,
+                language=language,
+                voice_clone_prompt=self.voice_clone_prompt,
+                **gen_kwargs,
+            )
+        return self.model.generate_custom_voice(
+            text=texts,
+            language="Korean" if self.voice == "Sohee" else "Auto",
+            speaker=self.voice,
+            instruct=self.instruct_text if self.instruct_text else None,
+            **gen_kwargs,
+        )
+
+    @staticmethod
+    def _is_device_error(err):
+        """재시도해 볼 만한 디바이스/메모리 오류인지 판정 (CUDA·MPS 공통)."""
+        msg = str(err).lower()
+        return any(k in msg for k in ("cuda", "mps", "metal", "out of memory"))
+
+    def _free_device_memory(self, torch):
+        """디바이스 캐시 정리. CUDA와 MPS는 API가 서로 다르다."""
+        import gc
+        if self.device == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        elif self.device == "mps" and torch.backends.mps.is_available():
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
+        gc.collect()
+
+    def _generate_with_retry(self, torch, texts, max_retries=3):
+        """한 배치를 합성. 디바이스 오류면 캐시를 비우고 재시도한다."""
+        for attempt in range(max_retries):
+            try:
+                with torch.no_grad():
+                    if self.tts_engine == "kokoro":
+                        return self._synthesize_kokoro(texts[0])
+                    return self._synthesize_qwen(texts)
+            except RuntimeError as e:
+                if not self._is_device_error(e) or attempt == max_retries - 1:
+                    raise
+                self.status.emit(f"⚠️ 디바이스 오류 발생, 재시도 중... ({attempt+2}/{max_retries})")
+                self._free_device_memory(torch)
+                time.sleep(1)
+        return None, None
+
+    def _iter_synthesized(self, torch, chunks):
+        """청크를 배치로 묶어 합성하되, 결과는 입력 순서대로 하나씩 내보낸다.
+
+        자막 타임라인(_track_cues)과 파일 분할이 '지금까지 쓴 전역 샘플 수'에
+        의존하므로 생성만 배치로 묶고 소비는 순차적으로 유지한다.
+
+        yield: (청크 인덱스, 청크 텍스트, 오디오, 샘플레이트, 청크당 생성 시간)"""
+        batch_size = self._resolve_batch_size()
+        start = 0
+        while start < len(chunks):
+            if not self._is_running:
+                return
+            group = chunks[start:start + batch_size]
+
+            batch_start = time.time()
+            try:
+                # 메모리 부족으로 실패한 배치는 그대로 재시도해 봐야 또 실패한다.
+                # 쪼개는 편이 빠르므로 배치일 때는 한 번만 시도한다.
+                wavs, sr = self._generate_with_retry(
+                    torch, group, max_retries=1 if len(group) > 1 else 3
+                )
+            except RuntimeError:
+                if len(group) == 1:
+                    raise
+                # 배치가 커서 실패했을 수 있다 → 비우고 1개씩 다시 시도
+                self.status.emit(f"⚠️ 배치 {len(group)}개 실패 → 1개씩 재시도")
+                self._free_device_memory(torch)
+                wavs, sr = [], None
+                for text in group:
+                    single, single_sr = self._generate_with_retry(torch, [text])
+                    wavs.extend(single or [])
+                    sr = single_sr or sr
+                # 남은 배치도 같은 이유로 실패할 테니 아예 크기를 줄인다
+                batch_size = max(1, len(group) // 2)
+                self.status.emit(f"⚠️ 이후 배치 크기를 {batch_size}(으)로 줄입니다")
+            elapsed = time.time() - batch_start
+
+            base = start          # yield 전에 다음 배치 위치로 옮기므로 따로 잡아 둔다
+            start += len(group)
+            if not wavs:
+                continue  # 배치 전체 실패 → 다음 배치로
+            per_chunk = elapsed / len(wavs)
+            for offset, wav in enumerate(wavs):
+                yield base + offset, group[offset], wav, sr, per_chunk
+
     def _run_generation(self, torch, start_time):
         """청크 단위로 음성 생성 후 파일로 저장 (Qwen/Kokoro 공통)"""
         try:
-            chunks = self._chunk_text(self.text)
+            # 빈 청크는 미리 걸러낸다 (배치 구성과 진행률 계산이 정확해진다)
+            chunks = [c for c in self._chunk_text(self.text) if c.strip()]
             total_chunks = len(chunks)
 
             import soundfile as sf
@@ -308,7 +489,8 @@ class TTSWorker(QThread):
             file_idx = 0             # 저장된 파일 번호
             saved_files = []
 
-            for i, chunk in enumerate(chunks):
+            # 생성은 배치로 묶고(GPU 활용률↑), 소비는 원래 순서대로 한 개씩.
+            for i, chunk, wav_data, sr, gen_time in self._iter_synthesized(torch, chunks):
                 # 중지 확인
                 if not self._is_running:
                     self.status.emit("⏹️ 사용자에 의해 중지됨. 현재까지 진행된 내용 저장 중...")
@@ -316,65 +498,17 @@ class TTSWorker(QThread):
 
                 chunk_start = time.time()
 
-                if not chunk.strip():
-                    continue
-
                 # 진행률 계산 (10% ~ 95% 범위에서 청크 진행률 반영)
                 chunk_progress = ((i + 1) / total_chunks) * 85
                 progress = int(10 + chunk_progress)
                 self.progress.emit(progress)
                 self.status.emit(f"처리 중... {i+1}/{total_chunks} 청크 ({progress}%) | 저장된 파일: {file_idx}개")
 
-                # TTS 생성 (CUDA 에러 시 최대 3회 재시도)
-                import torch
-                max_retries = 3
-                wavs, sr = None, None
-                for attempt in range(max_retries):
-                    try:
-                        with torch.no_grad():
-                            if self.tts_engine == "kokoro":
-                                wavs, sr = self._synthesize_kokoro(chunk)
-                            elif self.is_custom_voice:
-                                from document_parser import CUSTOM_VOICE_PRESETS
-                                voice_info = CUSTOM_VOICE_PRESETS.get(self.voice, {})
-                                language = voice_info.get("language", "Korean")
-                                wavs, sr = self.model.generate_voice_clone(
-                                    text=chunk,
-                                    language=language,
-                                    voice_clone_prompt=self.voice_clone_prompt,
-                                    max_new_tokens=2048,
-                                )
-                            else:
-                                wavs, sr = self.model.generate_custom_voice(
-                                    text=chunk,
-                                    language="Korean" if self.voice == "Sohee" else "Auto",
-                                    speaker=self.voice,
-                                    instruct=self.instruct_text if self.instruct_text else None,
-                                    max_new_tokens=2048,
-                                )
-                        break  # 성공 시 루프 탈출
-                    except RuntimeError as e:
-                        if "CUDA" in str(e) and attempt < max_retries - 1:
-                            self.status.emit(f"⚠️ CUDA 에러 발생, 재시도 중... ({attempt+2}/{max_retries})")
-                            torch.cuda.synchronize()
-                            torch.cuda.empty_cache()
-                            import gc; gc.collect()
-                            time.sleep(1)
-                        else:
-                            raise
-                if wavs is None:
-                    continue  # 생성 실패 시 다음 청크로
-
                 # 오디오 데이터를 CPU numpy로 즉시 이동 (GPU 메모리 해제)
-                wav_data = wavs[0]
                 if hasattr(wav_data, 'cpu'):
                     wav_data = wav_data.cpu().numpy()
                 elif hasattr(wav_data, 'numpy'):
                     wav_data = wav_data.numpy()
-
-                del wavs
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
                 # 볼륨 정규화 (peak normalization → -1dB target)
                 peak = np.max(np.abs(wav_data))
@@ -394,7 +528,8 @@ class TTSWorker(QThread):
                     self._stream_write(wav_data, sample_rate)
                     del wav_data
 
-                    chunk_time = time.time() - chunk_start
+                    # 생성 시간(배치에서 청크당으로 환산) + 이 청크의 저장 시간
+                    chunk_time = gen_time + (time.time() - chunk_start)
                     self.chunk_times.append(chunk_time)
                     if i > 0:
                         avg = sum(self.chunk_times) / len(self.chunk_times)
@@ -421,8 +556,8 @@ class TTSWorker(QThread):
                     segment_samples = len(leftover)
                     del combined
 
-                # 청크 처리 시간 기록
-                chunk_time = time.time() - chunk_start
+                # 청크 처리 시간 기록 (생성 시간 + 저장/변환 시간)
+                chunk_time = gen_time + (time.time() - chunk_start)
                 self.chunk_times.append(chunk_time)
 
                 # ETA 계산 (이동 평균 사용)

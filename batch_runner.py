@@ -190,6 +190,8 @@ def convert(text_path, out_dir, cfg, device):
         srt_mode=srt_mode,
     )
     worker.split_audio = split_audio
+    worker.batch_size = cfg.get("batch_size")
+    worker.torch_compile = cfg.get("torch_compile")
 
     state = {"pct": -1, "last_log": 0.0, "error": None, "done": False}
 
