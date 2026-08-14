@@ -158,6 +158,21 @@ def _gpu_utilization_nvidia():
     return int(util), float(used) / 1024, float(clock), float(power)
 
 
+def cuda_max_clock_mhz():
+    """이 카드가 낼 수 있는 최대 SM 클럭(MHz). 못 재면 nan.
+
+    torch 의 device properties 에는 이 항목이 버전에 따라 없다. hasattr 로
+    감싸면 조용히 건너뛰어 경고가 영영 안 뜨므로 nvidia-smi 로 직접 묻는다."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=clocks.max.sm",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5).stdout.strip().splitlines()
+        return float(out[0].strip()) if out else float("nan")
+    except Exception:
+        return float("nan")
+
+
 def cuda_device_used_gb():
     """지금 이 순간 GPU 가 쓰고 있는 총량(GiB). 못 재면 nan."""
     try:
@@ -398,6 +413,7 @@ def main():
                   if is_cuda else None)
     vram_limit = vram_total * CUDA_WARN if is_cuda else None
     vram_wall = vram_total * CUDA_FULL if is_cuda else None
+    clock_max = cuda_max_clock_mhz() if is_cuda else float("nan")
     cuda_baseline = cuda_device_used_gb() if is_cuda else None
     if is_cuda:
         print(f"GPU 메모리: 총 {vram_total:.2f} GiB / 측정 시작 시점 사용 "
@@ -476,6 +492,7 @@ def main():
 
     rtfs = {}          # (batch, chars) -> [RTF, ...]
     clean = {}         # (batch, chars) -> [유출 없이 끝난 회차의 RTF, ...]
+    clocks = []        # 회차별 평균 SM 클럭. 행끼리 비교 가능한지 판단하는 근거
     for batch_size, chars in combos:
         worker.batch_size, worker.batch_chars = batch_size, chars
         rtfs[(batch_size, chars)] = []
@@ -502,6 +519,8 @@ def main():
             audio_sec = samples / sr
             rtf = audio_sec / elapsed if elapsed else 0
             rtfs[(batch_size, chars)].append(rtf)
+            if is_cuda and sampler.clock_mean == sampler.clock_mean:
+                clocks.append(sampler.clock_mean)
             # 판정은 장치 전체 사용량(dev_peak)으로 한다. allocated 는 텐서만,
             # reserved 는 caching allocator 가 드라이버에서 받아 쥐고 있는 양이라
             # 둘 다 실점유가 아니다. 장치 사용량 − reserved ≈ CUDA context + 데스크톱.
@@ -626,6 +645,21 @@ def main():
 
     if noise is not None:
         print(f"측정 잡음 폭(같은 설정 반복 시): {noise:.1%}")
+
+    # 클럭이 흔들리면 RTF 는 설정이 아니라 그 흔들림을 잰 값이 된다. 실측에서
+    # 같은 설정·같은 문서가 1830MHz 실행에서 1.78, 700MHz 실행에서 0.87 로
+    # 나왔다 — 2배 차이 전부가 클럭이었다. 그래서 클럭 범위를 항상 찍고,
+    # 벌어지면 표 안에서의 비교부터 막는다.
+    if clocks:
+        lo, hi = min(clocks), max(clocks)
+        spread = (hi - lo) / hi if hi else 0
+        print(f"SM 클럭 범위: {lo:.0f}~{hi:.0f} MHz (최대 {clock_max:.0f} MHz)")
+        if spread > 0.15:
+            print(f"  ⚠️  회차 간 클럭이 {spread:.0%} 벌어졌다 — 이 표의 RTF 차이는 "
+                  f"설정 차이가 아니라 클럭 차이일 수 있다. 다시 잴 것")
+        elif hi < clock_max * 0.4:
+            print(f"  ⚠️  전 회차가 최대 클럭의 {hi / clock_max:.0%} 에 머물렀다. "
+                  f"표 안의 비교는 유효하지만, 다른 때 잰 RTF 와는 견줄 수 없다")
 
     # 실효 크기가 같은 조합끼리는 같은 것을 두 번 잰 것이다. 이걸 성능 차이로
     # 읽지 않도록 못을 박아 둔다 — 이번 작업에서 실제로 저지른 착각이다.
