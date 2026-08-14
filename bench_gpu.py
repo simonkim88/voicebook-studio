@@ -489,10 +489,15 @@ def main():
             # (실측: 할당 4.1G / 예약 8.2G / 카드 8.0G — 예약이 카드보다 컸다.)
             usable_vram = (vram_total - cuda_baseline) if is_cuda else 0
             measured = is_cuda and dev_peak == dev_peak
+            # 예약이 가용량을 넘었다는 것은 그만큼이 호스트 RAM 에 있다는 뜻이
+            # 맞다. 다만 그것이 곧 성능 저하는 아니다 — 넘친 부분이 allocator 가
+            # 쥐고만 있는 빈 블록이면 아무도 건드리지 않는다. 실측 반례: 예약
+            # 10.63G(가용 7.71G)인데 RTF 1.79 로 정상 최고 속도였다. 그래서
+            # 제외 사유가 아니라 경고로만 쓴다.
             overcommit = is_cuda and reserved > usable_vram
             tight = measured and dev_peak > vram_limit
-            spilled = overcommit or (measured and dev_peak > vram_wall)
-            mark = "!" if spilled else ("~" if tight else " ")
+            spilled = measured and dev_peak > vram_wall
+            mark = "!" if spilled else ("~" if (tight or overcommit) else " ")
             vram = (f" {dev_peak:>6.2f}G{mark} ({peak:>4.1f}/{reserved:>4.1f}G)"
                     if is_cuda else "")
 
@@ -523,11 +528,12 @@ def main():
                   f"{vram}{mps_cols}",
                   flush=True)
             if overcommit:
-                print(f"    ❌ 예약 {reserved:.2f}G 가 쓸 수 있던 양 "
+                print(f"    ⚠️  예약 {reserved:.2f}G 가 쓸 수 있던 양 "
                       f"{usable_vram:.2f}G (총 {vram_total:.2f}G − 다른 앱 "
-                      f"{cuda_baseline:.2f}G)를 넘었다 — 드라이버가 부족분을 시스템 "
-                      f"RAM 으로 채웠다. 이 행은 비교에 쓸 수 없다", flush=True)
-            elif spilled:
+                      f"{cuda_baseline:.2f}G)를 넘었다 — 그만큼은 시스템 RAM 에 있다. "
+                      f"쥐고만 있는 빈 블록일 수 있어 속도는 RTF 로 판단할 것",
+                      flush=True)
+            if spilled:
                 print(f"    ❌ VRAM {dev_peak:.2f}G — 총 {vram_total:.2f}G 의 벽에 "
                       f"닿았다. 더 못 늘어나므로 초과분은 시스템 RAM 으로 간다. "
                       f"이 행은 비교에 쓸 수 없다", flush=True)
