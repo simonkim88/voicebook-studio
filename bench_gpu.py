@@ -126,20 +126,40 @@ def _gpu_utilization_macos():
         capture_output=True, text=True, timeout=5,
     ).stdout
     m = re.search(r'"Device Utilization %"=(\d+)', out)
-    return int(m.group(1)) if m else None
+    # 반환 형식을 nvidia 쪽과 맞춘다: (사용률, 장치 메모리 GiB).
+    # 통합메모리라 '장치가 쓴 양' 이 따로 없으므로 메모리는 nan.
+    return (int(m.group(1)), float("nan")) if m else None
 
 
 def _gpu_utilization_nvidia():
-    """NVIDIA: nvidia-smi로 GPU 사용률(%) 샘플 1개.
+    """NVIDIA: nvidia-smi로 사용률(%)과 GPU 전체 메모리 사용량(GiB).
 
     ioreg와 달리 프로세스 기동이 비싸(~30ms) 샘플 간격을 너무 좁히면
-    측정 자체가 CPU를 잡아먹는다. 기본 0.2초면 무해한 수준이다."""
+    측정 자체가 CPU를 잡아먹는다. 기본 0.2초면 무해한 수준이다. 메모리는
+    같은 --query-gpu 에 항목만 더한 것이라 호출 수가 늘지 않는다.
+
+    프로세스별 점유(--query-compute-apps=used_gpu_memory)를 쓰지 않는 이유:
+    Windows 의 WDDM 드라이버 모드에서는 그 값이 전부 [N/A] 로 나온다(실측).
+    장치 전체 memory.used 는 데스크톱 상시 점유까지 포함하므로, '카드가
+    얼마나 찼는가' 를 묻는 이 판정에는 오히려 이쪽이 맞는 분모다."""
     out = subprocess.run(
-        ["nvidia-smi", "--query-gpu=utilization.gpu",
+        ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
          "--format=csv,noheader,nounits"],
         capture_output=True, text=True, timeout=5,
     ).stdout.strip().splitlines()
-    return int(out[0].strip()) if out else None
+    if not out:
+        return None
+    util, used = [x.strip() for x in out[0].split(",")]
+    return int(util), float(used) / 1024
+
+
+def cuda_device_used_gb():
+    """지금 이 순간 GPU 가 쓰고 있는 총량(GiB). 못 재면 nan."""
+    try:
+        sample = _gpu_utilization_nvidia()
+        return sample[1] if sample else float("nan")
+    except Exception:
+        return float("nan")
 
 
 # 플랫폼별 샘플러를 한 번만 정해 두고 재사용한다 (매 샘플마다 탐색하지 않도록).
@@ -147,7 +167,7 @@ _UTIL_BACKEND = "unknown"
 
 
 def gpu_utilization():
-    """현재 GPU 사용률(%) 샘플 1개. 잴 수 없으면 None."""
+    """현재 (GPU 사용률 %, 장치 메모리 사용량 GiB) 샘플 1개. 잴 수 없으면 None."""
     global _UTIL_BACKEND
     if _UTIL_BACKEND == "unknown":
         for name, fn in (("nvidia", _gpu_utilization_nvidia),
@@ -219,6 +239,10 @@ class GpuSampler:
         # 사용률 때문에 0.2초마다 깨어나므로 추가 비용이 거의 없다.
         self.sample_mps_memory = sample_mps_memory
         self.mem_samples = []
+        # CUDA: 장치 전체 메모리 사용량. 사용률 샘플과 같은 nvidia-smi 호출에서
+        # 딸려 오므로 공짜다. max_memory_allocated 와 달리 CUDA context 와
+        # 데스크톱 점유까지 포함한, 카드에 실제로 찬 양이다.
+        self.dev_mem_samples = []
         self._stop = threading.Event()
         self._thread = None
 
@@ -229,9 +253,12 @@ class GpuSampler:
 
     def _run(self):
         while not self._stop.is_set():
-            u = gpu_utilization()
-            if u is not None:
-                self.samples.append(u)
+            sample = gpu_utilization()
+            if sample is not None:
+                util, dev_mem = sample
+                self.samples.append(util)
+                if dev_mem == dev_mem:      # nan 이 아니면 (= CUDA)
+                    self.dev_mem_samples.append(dev_mem)
             if self.sample_mps_memory:
                 try:
                     import torch
@@ -245,6 +272,11 @@ class GpuSampler:
     @property
     def mem_peak_gb(self):
         return max(self.mem_samples) / 2**30 if self.mem_samples else float("nan")
+
+    @property
+    def dev_mem_peak_gb(self):
+        """측정 구간 중 카드에 가장 많이 차 있던 양(GiB). CUDA 전용."""
+        return max(self.dev_mem_samples) if self.dev_mem_samples else float("nan")
 
     def __exit__(self, *exc):
         self._stop.set()
@@ -324,12 +356,31 @@ def main():
     # 호스트 RAM 으로 흘려보낸다(sysmem fallback). 그러면 OutOfMemoryError 가
     # 발생하지 않아 _generate_batch 의 재귀 이등분도 돌지 않고, 측정값은
     # PCIe 를 타는 느린 경로가 섞인 것이 된다 — 조용히 무효가 되는 측정이다.
-    # 그래서 총 용량을 미리 알아 두고 초과한 행에 표시를 단다.
+    #
+    # 판정의 분모를 두 번 틀렸다. 처음엔 max_memory_allocated 를 total 과
+    # 견줬는데, ① allocated 는 텐서만 세고 CUDA context 와 allocator 단편화를
+    # 빼먹어 실점유보다 0.5G 남짓 작게 나오고 ② total 에는 데스크톱이 상시
+    # 쓰는 0.78G 가 이미 들어 있다. 두 오차가 같은 방향(안전해 보이게)으로
+    # 겹쳐 batch_chars=2500 을 잘못 채택했다. 지금은 nvidia-smi 의 장치 전체
+    # memory.used 를 표집해 쓴다 — 두 누락이 모두 자동으로 메워진다.
+    # 판정은 두 단계로 나눈다. 실측에서 장치 사용량 7.69G(총 8.00G)인데 RTF 는
+    # 정상(1.78)인 행을 봤다 — 카드가 가득 찬 것과 시스템 RAM 으로 새는 것은
+    # 다른 상태다. 하나로 뭉뚱그리면 멀쩡한 설정을 버리거나, 반대로 위험한
+    # 설정을 통과시킨다.
+    CUDA_WARN = 0.85    # 넘으면 여유 없음 — 다른 앱이 뜨면 넘친다. 경고만
+    CUDA_FULL = 0.98    # 벽에 닿았다 — 더 못 늘어나므로 초과분은 RAM 행. 제외
     vram_total = (torch.cuda.get_device_properties(0).total_memory / 2**30
                   if is_cuda else None)
+    vram_limit = vram_total * CUDA_WARN if is_cuda else None
+    vram_wall = vram_total * CUDA_FULL if is_cuda else None
+    cuda_baseline = cuda_device_used_gb() if is_cuda else None
     if is_cuda:
-        print(f"GPU 메모리: {vram_total:.2f} GiB "
-              f"— 이 값을 넘는 행은 시스템 RAM 으로 샌 것이라 비교에 쓸 수 없다\n")
+        print(f"GPU 메모리: 총 {vram_total:.2f} GiB / 측정 시작 시점 사용 "
+              f"{cuda_baseline:.2f} GiB (데스크톱·다른 앱)")
+        print(f"판정: {vram_limit:.2f} GiB({CUDA_WARN:.0%}) 초과 = 여유 없음(경고), "
+              f"{vram_wall:.2f} GiB({CUDA_FULL:.0%}) 초과 = 벽에 닿음(후보 제외)")
+        print("→ VRAM 열은 nvidia-smi 의 장치 전체 사용량이다. 괄호는 torch 의 "
+              "할당/예약 피크로, 장치 사용량과의 차이가 CUDA context 다\n")
 
     # 맥도 같은 함정이 있다. recommended_max_memory 는 하드 한도가 아니라
     # 소프트 경계라, 넘어도 OOM 이 아니라 압축·스왑으로 조용히 느려진다.
@@ -353,12 +404,11 @@ def main():
         print(f"측정 시작 시점 스왑: {swap_used_gb() or 0:.2f} GiB "
               f"— 회차 중 스왑이 늘면 그 행은 무효다\n")
 
-    mem_col = " " * 0
     print(f"{'batch':>6} {'chars':>6} {'실효':>5} {'회':>3} {'생성 오디오':>12} "
           f"{'걸린 시간':>10} {'RTF':>7} {'GPU평균':>7} {'GPU최대':>7}"
-          + (f" {'VRAM':>8}" if is_cuda else "")
+          + (f" {'VRAM':>8} {'(할당/예약)':>12}" if is_cuda else "")
           + (f" {'MPS메모리':>10} {'스왑Δ':>7}" if is_mps else ""))
-    print("-" * (76 + (9 if is_cuda else 0) + (19 if is_mps else 0)))
+    print("-" * (76 + (19 if is_cuda else 0) + (19 if is_mps else 0)))
 
     # 모델은 한 번만 올리고 배치 크기만 바꿔 가며 잰다 (로딩이 측정보다 오래 걸린다).
     # torch.compile은 모델을 제자리에서 바꾸므로 한 번만 적용한다.
@@ -399,15 +449,21 @@ def main():
     worker._generate_batch(torch, texts[:1])
 
     rtfs = {}          # (batch, chars) -> [RTF, ...]
-    spilled_keys = set()   # 물리 VRAM 을 넘겨 시스템 RAM 을 쓴 조합
+    clean = {}         # (batch, chars) -> [유출 없이 끝난 회차의 RTF, ...]
     for batch_size, chars in combos:
         worker.batch_size, worker.batch_chars = batch_size, chars
         rtfs[(batch_size, chars)] = []
+        clean[(batch_size, chars)] = []
         eff = effective[(batch_size, chars)]
 
         for rep in range(args.reps):
             samples = 0
             if is_cuda:
+                # 캐시를 먼저 비우고 피크를 리셋한다. reset_peak_memory_stats 는
+                # 카운터만 되돌릴 뿐 allocator 가 쥐고 있는 풀은 그대로 두므로,
+                # 비우지 않으면 워밍업이나 앞 조합이 부풀려 놓은 예약량을 이
+                # 회차의 값으로 물려받는다.
+                worker._free_device_memory(torch)
                 torch.cuda.reset_peak_memory_stats()
             swap_before = swap_used_gb() if is_mps else None
             with GpuSampler(sample_mps_memory=is_mps) as sampler:
@@ -420,15 +476,29 @@ def main():
             audio_sec = samples / sr
             rtf = audio_sec / elapsed if elapsed else 0
             rtfs[(batch_size, chars)].append(rtf)
+            # 판정은 장치 전체 사용량(dev_peak)으로 한다. allocated 는 텐서만,
+            # reserved 는 caching allocator 가 드라이버에서 받아 쥐고 있는 양이라
+            # 둘 다 실점유가 아니다. 장치 사용량 − reserved ≈ CUDA context + 데스크톱.
             peak = torch.cuda.max_memory_allocated() / 2**30 if is_cuda else 0
-            spilled = is_cuda and peak > vram_total
-            if spilled:
-                spilled_keys.add((batch_size, chars))
-            vram = f" {peak:>6.2f}G{'!' if spilled else ' '}" if is_cuda else ""
+            reserved = torch.cuda.max_memory_reserved() / 2**30 if is_cuda else 0
+            dev_peak = sampler.dev_mem_peak_gb if is_cuda else float("nan")
+            # 유출의 직접 증거는 reserved 다. allocator 는 cudaMalloc 으로 풀을
+            # 받는데, Windows 의 sysmem fallback 이 켜져 있으면 물리 VRAM 이
+            # 모자라도 그 호출이 실패하지 않고 호스트 RAM 으로 채워 준다.
+            # 따라서 '예약량 > 우리가 쓸 수 있었던 양' 이면 그 차이는 RAM 에 있다.
+            # (실측: 할당 4.1G / 예약 8.2G / 카드 8.0G — 예약이 카드보다 컸다.)
+            usable_vram = (vram_total - cuda_baseline) if is_cuda else 0
+            measured = is_cuda and dev_peak == dev_peak
+            overcommit = is_cuda and reserved > usable_vram
+            tight = measured and dev_peak > vram_limit
+            spilled = overcommit or (measured and dev_peak > vram_wall)
+            mark = "!" if spilled else ("~" if tight else " ")
+            vram = (f" {dev_peak:>6.2f}G{mark} ({peak:>4.1f}/{reserved:>4.1f}G)"
+                    if is_cuda else "")
 
             # MPS: 피크 점유와 스왑 증가분. 스왑이 늘었으면 CUDA 의 sysmem
             # fallback 과 같은 이유로 그 행은 비교에 못 쓴다.
-            mps_cols, swapped = "", False
+            mps_cols, swapped, over = "", False, False
             if is_mps:
                 mem_peak = sampler.mem_peak_gb
                 swap_delta = ((swap_after - swap_before)
@@ -436,19 +506,35 @@ def main():
                               else float("nan"))
                 swapped = swap_delta == swap_delta and swap_delta > 0.05
                 over = mem_peak == mem_peak and mem_peak > mps_limit
-                if swapped or over:
-                    spilled_keys.add((batch_size, chars))
                 mps_cols = (f" {mem_peak:>8.2f}G{'!' if over else ' '}"
                             f" {swap_delta:>+6.2f}G{'!' if swapped else ' '}")
+
+            # 유출은 조합이 아니라 회차의 성질이다. 생성 길이가 확률적으로
+            # 달라지므로 같은 설정도 어떤 회차는 넘고 어떤 회차는 안 넘는다
+            # (실측: 137초 회차 예약 6.2G 정상, 156초 회차 예약 8.1G 유출).
+            # 그래서 깨끗한 회차만 따로 모아 평균을 낸다. 맥의 스왑·한도 초과도
+            # 같은 성질이라 함께 여기서 건다.
+            if not (spilled or swapped or over):
+                clean[(batch_size, chars)].append(rtf)
 
             print(f"{batch_size:>6} {chars:>6} {eff:>5.1f} {rep+1:>3} "
                   f"{audio_sec:>10.1f}초 {elapsed:>9.1f}초 "
                   f"{rtf:>7.2f} {sampler.mean:>5.0f}% {sampler.peak:>5.0f}%"
                   f"{vram}{mps_cols}",
                   flush=True)
-            if spilled:
-                print(f"    ⚠️  VRAM {vram_total:.2f}G 초과 — 시스템 RAM 으로 샜다. "
-                      f"이 행은 배치 설정 비교에 쓸 수 없다", flush=True)
+            if overcommit:
+                print(f"    ❌ 예약 {reserved:.2f}G 가 쓸 수 있던 양 "
+                      f"{usable_vram:.2f}G (총 {vram_total:.2f}G − 다른 앱 "
+                      f"{cuda_baseline:.2f}G)를 넘었다 — 드라이버가 부족분을 시스템 "
+                      f"RAM 으로 채웠다. 이 행은 비교에 쓸 수 없다", flush=True)
+            elif spilled:
+                print(f"    ❌ VRAM {dev_peak:.2f}G — 총 {vram_total:.2f}G 의 벽에 "
+                      f"닿았다. 더 못 늘어나므로 초과분은 시스템 RAM 으로 간다. "
+                      f"이 행은 비교에 쓸 수 없다", flush=True)
+            elif tight:
+                print(f"    ⚠️  VRAM {dev_peak:.2f}G — 남은 여유 "
+                      f"{vram_total - dev_peak:.2f}G 뿐이다. 지금은 정상 속도라도 "
+                      f"다른 앱이 뜨면 넘친다", flush=True)
             if is_mps and swapped:
                 print(f"    ⚠️  측정 중 스왑이 {swap_delta:+.2f}G 늘었다 — 압축·스왑 "
                       f"경로가 섞였다. 이 행은 비교에 쓸 수 없다", flush=True)
@@ -463,26 +549,41 @@ def main():
 
     print()
 
-    means = {k: sum(v) / len(v) for k, v in rtfs.items()}
-    print(f"{'batch':>6} {'chars':>6} {'실효':>5} {'평균 RTF':>10} {'최소~최대':>16}")
+    # 평균은 유출 없이 끝난 회차만으로 낸다. 유출된 회차는 PCIe 를 타는 다른
+    # 작업을 잰 것이라 같은 설정의 값으로 섞을 수 없다.
+    means = {k: (sum(clean[k]) / len(clean[k]) if clean[k]
+                 else sum(v) / len(v)) for k, v in rtfs.items()}
+    print(f"{'batch':>6} {'chars':>6} {'실효':>5} {'평균 RTF':>10} {'최소~최대':>16} "
+          f"{'유효 회차':>10}")
     for key in combos:
-        v = rtfs[key]
+        v = clean[key] or rtfs[key]
+        note = f"{len(clean[key])}/{len(rtfs[key])}"
         print(f"{key[0]:>6} {key[1]:>6} {effective[key]:>5.1f} "
-              f"{means[key]:>10.2f} {min(v):>7.2f} ~ {max(v):<7.2f}")
+              f"{means[key]:>10.2f} {min(v):>7.2f} ~ {max(v):<7.2f} "
+              f"{note:>10}{'  ← 전부 유출' if not clean[key] else ''}")
 
     # 같은 설정을 반복했을 때의 편차가 이 측정의 잡음 폭이다.
     # 조합 간 차이가 그보다 작으면 아무것도 주장할 수 없다.
-    noise = max((max(v) - min(v)) / (sum(v) / len(v)) for v in rtfs.values() if len(v) > 1) \
-        if args.reps > 1 else None
+    noise = max((max(v) - min(v)) / (sum(v) / len(v))
+                for v in clean.values() if len(v) > 1) if args.reps > 1 and \
+        any(len(v) > 1 for v in clean.values()) else None
 
-    # 시스템 RAM 으로 샌 조합은 후보에서 뺀다. 그 행이 빨라 보여도 이 기계에서
+    # 회차가 전부 유출된 조합은 후보에서 뺀다. 그 행이 빨라 보여도 이 기계에서
     # 안전하게 쓸 수 있는 설정이 아니고, 애초에 측정 자체가 오염돼 있다.
-    usable = {k: v for k, v in means.items() if k not in spilled_keys}
+    spilled_keys = {k for k in combos if not clean[k]}
+    usable = {k: means[k] for k in combos if clean[k]}
+    partial = {k: (len(rtfs[k]) - len(clean[k])) for k in usable
+               if len(clean[k]) < len(rtfs[k])}
     if spilled_keys and usable:
         dropped = ", ".join(f"batch={b}/chars={c}" for b, c in sorted(spilled_keys))
-        print(f"VRAM 초과로 후보에서 제외: {dropped}")
+        print(f"\n모든 회차가 유출돼 후보에서 제외: {dropped}")
+    if partial:
+        detail = ", ".join(f"batch={b}/chars={c}({n}회)" for (b, c), n in sorted(partial.items()))
+        print(f"\n일부 회차만 유출돼 그 회차를 뺀 평균이다: {detail}")
+        print("  → 같은 설정이 회차에 따라 넘치기도 한다는 뜻이다. 실사용에서는 "
+              "넘치는 쪽도 그대로 겪게 되므로 '평소엔 괜찮다' 로 읽지 말 것")
     if not usable:
-        print("모든 조합이 VRAM 을 넘겼다. 예산을 낮춰 다시 잴 것.")
+        print("\n모든 조합의 모든 회차가 유출됐다. 예산을 낮춰 다시 잴 것.")
         return
     best = max(usable, key=usable.get)
     # 기준선은 실효 배치가 가장 작은 조합 (보통 batch=1, 없으면 예산이 가장 빡빡한 것)
