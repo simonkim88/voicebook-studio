@@ -169,6 +169,24 @@ def gpu_utilization():
         return None
 
 
+def system_available_gb():
+    """지금 이 순간 실제로 쓸 수 있는 메모리(GiB). free + inactive(회수 가능).
+
+    통합메모리는 GPU 전용이 아니라 다른 앱과 나눠 쓴다. 그래서
+    recommended_max_memory() 를 그대로 한도로 삼으면 안 된다 — 그것은
+    '나 혼자 쓸 때' 의 값이다. Windows 에서 카드 스펙(total)을 분모로 삼았다가
+    데스크톱 상시 점유를 빼먹은 것과 같은 실수가 된다."""
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        page = int(re.search(r"page size of (\d+)", out).group(1))
+        def pages(label):
+            m = re.search(rf"{label}:\s+(\d+)", out)
+            return int(m.group(1)) if m else 0
+        return (pages("Pages free") + pages("Pages inactive")) * page / 2**30
+    except Exception:
+        return float("nan")
+
+
 def swap_used_gb():
     """macOS: 지금 쓰고 있는 스왑(GB). 실패하면 None.
 
@@ -318,10 +336,20 @@ def main():
     # (실제로 91분 변환 뒤 앱이 40.6GB 를 물고 스왑 12.3GB 까지 간 적이 있다.)
     # 통합메모리는 다른 앱과 공유하므로 이 한도는 '나 혼자 쓸 때'의 값이다.
     is_mps = device == "mps"
-    mps_limit = torch.mps.recommended_max_memory() / 2**30 if is_mps else None
+    # 한도는 recommended_max_memory 가 아니라 '지금 실제로 비어 있는 양' 이다.
+    # 다른 앱이 떠 있는 상태가 실사용 환경이므로 그것을 기본 전제로 잡는다.
+    # 실측: batch=4 가 26.3G 를 잡았을 때 권장 최대(37.4G) 기준으로는 "안전"
+    # 으로 통과했지만 다른 앱 13.2G 와 합쳐 한도를 넘겨 프로세스가 죽었다.
+    MPS_SAFETY = 0.8   # 가용량의 80% 를 넘으면 위험으로 본다
+    mps_recommended = torch.mps.recommended_max_memory() / 2**30 if is_mps else None
+    mps_avail = system_available_gb() if is_mps else None
+    mps_limit = min(mps_recommended, mps_avail) * MPS_SAFETY if is_mps else None
     if is_mps:
-        print(f"MPS 권장 최대: {mps_limit:.1f} GiB (통합메모리 공유) "
-              f"— 넘으면 오류 없이 압축·스왑으로 느려진다")
+        others = mps_recommended - mps_avail
+        print(f"MPS 권장 최대 {mps_recommended:.1f} GiB / 지금 가용 {mps_avail:.1f} GiB "
+              f"(다른 앱이 약 {max(0, others):.1f} GiB 점유)")
+        print(f"판정 한도: {mps_limit:.1f} GiB (가용량의 {MPS_SAFETY:.0%}) "
+              f"— 넘으면 오류 없이 압축·스왑으로 느려지거나 프로세스가 죽는다")
         print(f"측정 시작 시점 스왑: {swap_used_gb() or 0:.2f} GiB "
               f"— 회차 중 스왑이 늘면 그 행은 무효다\n")
 
@@ -424,6 +452,10 @@ def main():
             if is_mps and swapped:
                 print(f"    ⚠️  측정 중 스왑이 {swap_delta:+.2f}G 늘었다 — 압축·스왑 "
                       f"경로가 섞였다. 이 행은 비교에 쓸 수 없다", flush=True)
+            if is_mps and over:
+                print(f"    ⚠️  MPS 메모리 {mem_peak:.2f}G 가 판정 한도 "
+                      f"{mps_limit:.2f}G 를 넘었다 — 다른 앱과 함께 쓰는 실사용 "
+                      f"환경에서는 신뢰할 수 없는 설정이다", flush=True)
 
             worker._free_device_memory(torch)
 
