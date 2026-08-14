@@ -126,9 +126,10 @@ def _gpu_utilization_macos():
         capture_output=True, text=True, timeout=5,
     ).stdout
     m = re.search(r'"Device Utilization %"=(\d+)', out)
-    # 반환 형식을 nvidia 쪽과 맞춘다: (사용률, 장치 메모리 GiB).
-    # 통합메모리라 '장치가 쓴 양' 이 따로 없으므로 메모리는 nan.
-    return (int(m.group(1)), float("nan")) if m else None
+    # 반환 형식을 nvidia 쪽과 맞춘다: (사용률, 장치 메모리 GiB, SM 클럭, 전력).
+    # 통합메모리라 '장치가 쓴 양' 이 따로 없고 클럭·전력도 못 읽으므로 nan.
+    nan = float("nan")
+    return (int(m.group(1)), nan, nan, nan) if m else None
 
 
 def _gpu_utilization_nvidia():
@@ -141,16 +142,20 @@ def _gpu_utilization_nvidia():
     프로세스별 점유(--query-compute-apps=used_gpu_memory)를 쓰지 않는 이유:
     Windows 의 WDDM 드라이버 모드에서는 그 값이 전부 [N/A] 로 나온다(실측).
     장치 전체 memory.used 는 데스크톱 상시 점유까지 포함하므로, '카드가
-    얼마나 찼는가' 를 묻는 이 판정에는 오히려 이쪽이 맞는 분모다."""
+    얼마나 찼는가' 를 묻는 이 판정에는 오히려 이쪽이 맞는 분모다.
+
+    SM 클럭과 전력도 함께 본다. 같은 설정·같은 문서인데 RTF 가 0.78 과 1.79
+    로 갈리는 실행이 있었고, 메모리 지표로는 두 상태가 구분되지 않았다.
+    클럭이 내려앉는지 여부가 남은 후보다."""
     out = subprocess.run(
-        ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+        ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,clocks.sm,power.draw",
          "--format=csv,noheader,nounits"],
         capture_output=True, text=True, timeout=5,
     ).stdout.strip().splitlines()
     if not out:
         return None
-    util, used = [x.strip() for x in out[0].split(",")]
-    return int(util), float(used) / 1024
+    util, used, clock, power = [x.strip() for x in out[0].split(",")]
+    return int(util), float(used) / 1024, float(clock), float(power)
 
 
 def cuda_device_used_gb():
@@ -243,6 +248,9 @@ class GpuSampler:
         # 딸려 오므로 공짜다. max_memory_allocated 와 달리 CUDA context 와
         # 데스크톱 점유까지 포함한, 카드에 실제로 찬 양이다.
         self.dev_mem_samples = []
+        # SM 클럭·전력. 같은 설정이 2.3배 갈리는 원인을 좁히려고 함께 찍는다.
+        self.clock_samples = []
+        self.power_samples = []
         self._stop = threading.Event()
         self._thread = None
 
@@ -255,10 +263,12 @@ class GpuSampler:
         while not self._stop.is_set():
             sample = gpu_utilization()
             if sample is not None:
-                util, dev_mem = sample
+                util, dev_mem, clock, power = sample
                 self.samples.append(util)
                 if dev_mem == dev_mem:      # nan 이 아니면 (= CUDA)
                     self.dev_mem_samples.append(dev_mem)
+                    self.clock_samples.append(clock)
+                    self.power_samples.append(power)
             if self.sample_mps_memory:
                 try:
                     import torch
@@ -277,6 +287,21 @@ class GpuSampler:
     def dev_mem_peak_gb(self):
         """측정 구간 중 카드에 가장 많이 차 있던 양(GiB). CUDA 전용."""
         return max(self.dev_mem_samples) if self.dev_mem_samples else float("nan")
+
+    @property
+    def clock_mean(self):
+        """측정 구간의 평균 SM 클럭(MHz). CUDA 전용."""
+        c = self.clock_samples
+        return sum(c) / len(c) if c else float("nan")
+
+    @property
+    def power_mean(self):
+        """측정 구간의 평균 소비 전력(W). CUDA 전용.
+
+        클럭이 낮은데 전력도 낮으면 '일이 없어서' 이고, 전력이 높은데 느리면
+        연산 외의 곳(메모리 전송)에서 시간을 쓰고 있다는 뜻이다."""
+        p = self.power_samples
+        return sum(p) / len(p) if p else float("nan")
 
     def __exit__(self, *exc):
         self._stop.set()
@@ -406,7 +431,8 @@ def main():
 
     print(f"{'batch':>6} {'chars':>6} {'실효':>5} {'회':>3} {'생성 오디오':>12} "
           f"{'걸린 시간':>10} {'RTF':>7} {'GPU평균':>7} {'GPU최대':>7}"
-          + (f" {'VRAM':>8} {'(할당/예약)':>12}" if is_cuda else "")
+          + (f" {'VRAM':>8} {'(할당/예약)':>12} {'클럭':>7} {'전력':>6}"
+             if is_cuda else "")
           + (f" {'MPS메모리':>10} {'스왑Δ':>7}" if is_mps else ""))
     print("-" * (76 + (19 if is_cuda else 0) + (19 if is_mps else 0)))
 
@@ -499,6 +525,7 @@ def main():
             spilled = measured and dev_peak > vram_wall
             mark = "!" if spilled else ("~" if (tight or overcommit) else " ")
             vram = (f" {dev_peak:>6.2f}G{mark} ({peak:>4.1f}/{reserved:>4.1f}G)"
+                    f" {sampler.clock_mean:>5.0f}MHz {sampler.power_mean:>4.0f}W"
                     if is_cuda else "")
 
             # MPS: 피크 점유와 스왑 증가분. 스왑이 늘었으면 CUDA 의 sysmem
