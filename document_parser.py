@@ -1,4 +1,5 @@
 # document_parser.py - 문서 파싱 모듈
+import html
 import os
 import re
 import json
@@ -130,11 +131,26 @@ class DocumentParser:
                         content = item.get_content().decode('utf-8')
                         
                         # HTML 테이블 제외 (<table> ~ </table>)
-                        content = re.sub(r'<table[^>]*>.*?</table>', ' ', content, flags=re.DOTALL | re.IGNORECASE)
-                        
+                        content = re.sub(r'<table[^>]*>.*?</table>', '\n\n', content, flags=re.DOTALL | re.IGNORECASE)
+                        content = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', content,
+                                         flags=re.DOTALL | re.IGNORECASE)
+
+                        # 태그를 지우기 전에 줄·문단 경계를 개행으로 남긴다.
+                        # (예전엔 \s+ 로 전부 뭉개서 챕터 하나가 한 줄이 됐고,
+                        #  그 결과 .srt 에 제목·저자·소제목이 본문과 한 큐에 섞였다)
+                        content = re.sub(r'<br\s*/?>', '\n', content, flags=re.IGNORECASE)
+                        content = re.sub(
+                            r'</(p|div|h[1-6]|li|dd|dt|tr|pre|blockquote|figcaption|section|article)\s*>',
+                            '\n\n', content, flags=re.IGNORECASE)
+
                         # 나머지 HTML 태그 제거
                         content = re.sub(r'<[^>]+>', ' ', content)
-                        content = re.sub(r'\s+', ' ', content).strip()
+                        content = html.unescape(content)
+
+                        # 줄 안쪽 공백만 정리하고 개행은 보존
+                        content = re.sub(r'[^\S\n]+', ' ', content)
+                        content = re.sub(r' *\n *', '\n', content)
+                        content = re.sub(r'\n{3,}', '\n\n', content).strip()
                         if content:
                             texts.append(content)
                     except:

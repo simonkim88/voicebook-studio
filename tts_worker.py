@@ -187,12 +187,16 @@ class TTSWorker(QThread):
         self.torch_compile = None
         # torch.compile 의 mode. None 이면 _torch_compile_mode() 가 디바이스별로 정한다.
         self.torch_compile_mode = None
+        # torch.compile 로 바꿔치기한 (소유 모듈, 원본 모듈) 쌍. 컴파일된 커널이
+        # NaN 을 내면 여기 담아둔 원본으로 되돌려 eager 로 계속 간다.
+        self._compiled_originals = []
 
         # SRT 자막(오디오-텍스트 매칭) 출력
         # "none": 만들지 않음 / "per_file": 오디오 파일마다 1개 / "merged": 전체 1개
         self.srt_mode = srt_mode if srt_mode in ("none", "per_file", "merged") else "none"
         self.srt_files = []            # 생성된 .srt 경로 목록
         self._timeline = SrtTimeline() if self.srt_mode != "none" else None
+        self._chunk_block_starts = []  # 청크별 "새 문단에서 시작하는가" (자막 레이아웃용)
         self._written_samples = 0      # 지금까지 파일로 저장한 전역 샘플 수
         self._last_engine_segments = None  # 엔진이 문장 단위로 준 구간 (Kokoro)
         self._stream_writer = None     # 분할 없이 저장할 때 쓰는 스트리밍 핸들
@@ -361,6 +365,7 @@ class TTSWorker(QThread):
                 continue
             try:
                 owner.model = torch.compile(module, mode=mode)
+                self._compiled_originals.append((owner, module))
                 compiled.append(f"{type(owner).__name__}.model")
             except Exception as e:
                 print(f"[warn] torch.compile 실패, 기본 모드로 진행: {e}")
@@ -370,6 +375,44 @@ class TTSWorker(QThread):
             print(f"[info] torch.compile 적용: {', '.join(compiled)} (mode={mode})")
         else:
             print("[warn] torch.compile 대상을 찾지 못했습니다.")
+
+    def _disable_torch_compile(self):
+        """컴파일된 모듈을 원본으로 되돌린다. 되돌린 게 있으면 True.
+
+        MPS 의 inductor 가 만든 커널이 로짓을 통째로 NaN 으로 만드는 일이 있다
+        (_is_retryable_error 참고). 그 청크만 버리는 대신 eager 로 내려와 남은
+        변환을 끝까지 마치기 위한 탈출구다."""
+        if not self._compiled_originals:
+            return False
+        for owner, module in self._compiled_originals:
+            owner.model = module
+        self._compiled_originals = []
+        return True
+
+    @staticmethod
+    def _is_retryable_error(e):
+        """다시 해보면 될 수도 있는 RuntimeError 인가.
+
+        두 부류를 재시도한다.
+
+        1) CUDA 런타임 에러 — 원래부터 재시도하던 것.
+        2) "probability tensor contains either `inf`, `nan` or element < 0" —
+           transformers 의 _sample 이 torch.multinomial 앞에서 내는 에러다.
+           MPS + torch.compile 조합에서 실제로 나온다: 서로 길이가 다른 청크를
+           연달아 넣으면 inductor 가 세 번째 길이에서 동적 shape 커널로
+           재컴파일하는데, 이 커널이 프리필 한 번 만에 로짓 3072 개를 전부
+           NaN 으로 만든다 (M4 Pro / torch 2.10.0 / 0.6B / bfloat16 실측:
+           길이가 제각각인 청크 30 개 중 1 개 실패, 실패는 항상 '세 번째로
+           등장한 길이'에서 0.1 초 만에, probs 는 3072/3072 NaN).
+           torch.compile 을 끄면 같은 청크로 0/19 실패다.
+
+           확률적이라 그대로 다시 하면 대개 통과하고, 두 번째도 실패하면
+           _call_engine 이 컴파일을 끄고 마지막으로 한 번 더 해본다.
+        """
+        msg = str(e)
+        if "CUDA" in msg:
+            return True
+        return "probability tensor contains" in msg
 
     def _free_device_memory(self, torch):
         """디바이스 캐시 정리. CUDA와 MPS는 API가 서로 다르다."""
@@ -395,6 +438,8 @@ class TTSWorker(QThread):
         self.model = None
         self.kokoro_pipeline = None
         self.voice_clone_prompt = None
+        # 컴파일 전 원본 모듈을 붙들고 있으면 모델이 통째로 안 풀린다
+        self._compiled_originals = []
         try:
             self._free_device_memory(torch)
         except Exception as e:
@@ -432,16 +477,21 @@ class TTSWorker(QThread):
         self._last_engine_segments = segments
         return [np.concatenate(parts)], 24000
 
-    def _track_cues(self, chunk, wav_data, sample_rate):
-        """이번 청크의 오디오를 자막 타임라인에 반영"""
+    def _track_cues(self, chunk, wav_data, sample_rate, starts_block=True):
+        """이번 청크의 오디오를 자막 타임라인에 반영.
+
+        starts_block: 이 청크가 원문에서 새 문단으로 시작하는가 (_chunk_text_with_layout).
+        긴 단락을 잘라 만든 이어지는 청크면 False 여야 문단이 쪼개지지 않는다."""
         if self._timeline is None:
             self._last_engine_segments = None  # 자막을 안 만들어도 참조는 즉시 해제
             return
         try:
             if self._last_engine_segments:
-                self._timeline.add_engine_segments(self._last_engine_segments, sample_rate)
+                self._timeline.add_engine_segments(
+                    self._last_engine_segments, sample_rate, starts_block=starts_block)
             else:
-                self._timeline.add_chunk(chunk, wav_data, sample_rate)
+                self._timeline.add_chunk(
+                    chunk, wav_data, sample_rate, starts_block=starts_block)
         except Exception as e:
             print(f"[warn] 자막 타임라인 기록 실패: {e}")
         finally:
@@ -598,14 +648,17 @@ class TTSWorker(QThread):
             except torch.cuda.OutOfMemoryError:
                 raise          # VRAM 부족은 _generate_batch 가 배치를 줄여 처리한다
             except RuntimeError as e:
-                if "CUDA" in str(e) and attempt < max_retries - 1:
-                    self.status.emit(f"⚠️ CUDA 에러 발생, 재시도 중... ({attempt+2}/{max_retries})")
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-                    import gc; gc.collect()
-                    time.sleep(1)
-                else:
+                if attempt >= max_retries - 1 or not self._is_retryable_error(e):
                     raise
+                # 마지막 재시도 전에는 torch.compile 을 걷어낸다. NaN 로짓은
+                # 컴파일된 커널에서 오므로, 같은 커널로 세 번 두드려봐야 소용없다.
+                if attempt == max_retries - 2 and self._disable_torch_compile():
+                    self.status.emit("⚠️ 컴파일된 커널이 불안정합니다 — 최적화를 끄고 계속합니다")
+                    print("[warn] NaN 로짓으로 torch.compile 을 해제하고 eager 로 전환")
+                kind = "CUDA 에러" if "CUDA" in str(e) else "생성 실패(NaN)"
+                self.status.emit(f"⚠️ {kind} 발생, 재시도 중... ({attempt+2}/{max_retries})")
+                self._free_device_memory(torch)
+                time.sleep(1)
         return None, None
 
     def _generate_batch(self, torch, texts):
@@ -659,7 +712,9 @@ class TTSWorker(QThread):
     def _run_generation(self, torch, start_time):
         """청크 단위로 음성 생성 후 파일로 저장 (Qwen/Kokoro 공통)"""
         try:
-            chunks = [c for c in self._chunk_text(self.text) if c.strip()]
+            layout = [(c, b) for c, b in self._chunk_text_with_layout(self.text) if c.strip()]
+            chunks = [c for c, _ in layout]
+            self._chunk_block_starts = [b for _, b in layout]
             total_chunks = len(chunks)
 
             import soundfile as sf
@@ -703,7 +758,9 @@ class TTSWorker(QThread):
                 max_samples = int(max_duration_sec * sample_rate)
 
                 # 자막 타임라인 기록 (저장 직전 = 전역 샘플 순서 그대로)
-                self._track_cues(chunk, wav_data, sample_rate)
+                self._track_cues(chunk, wav_data, sample_rate,
+                                 starts_block=self._chunk_block_starts[i]
+                                 if i < len(self._chunk_block_starts) else True)
 
                 if not self.split_audio:
                     # 분할 없음 → 바로 디스크로 흘려보낸다 (메모리에 쌓지 않음)
@@ -844,34 +901,60 @@ class TTSWorker(QThread):
         return text.strip()
 
     def _split_long_paragraph(self, para, max_chars):
-        """긴 단락을 문장 단위로 분할"""
-        # 문장 경계로 분할 (한국어/영어/일본어/중국어 문장부호)
-        sentences = re.split(r'(?<=[.!?。！？\n])\s*', para)
+        """긴 단락을 문장 단위로 분할. 반환: [(청크, 새 문단에서 시작하는가)]
+
+        원문 줄바꿈은 자막 문단 나누기의 유일한 근거이므로 공백으로 뭉개면 안 된다.
+        조각을 이어 붙일 때 원래 줄이 달랐으면 '\n' 으로, 같은 줄이면 ' ' 로 잇는다.
+        """
+        # (문장, 새 줄에서 시작하는가)
+        units = []
+        for line in para.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            first_of_line = True
+            for sent in re.split(r'(?<=[.!?。！？])\s*', line):
+                sent = sent.strip()
+                if not sent:
+                    continue
+                units.append((sent, first_of_line and bool(units)))
+                first_of_line = False
+
         chunks = []
         current = ""
-        for sent in sentences:
-            sent = sent.strip()
-            if not sent:
+        # 단락의 첫 청크만 새 문단이다. 잘려 나온 뒤쪽 청크는 같은 문단의 연속.
+        starts_block = True
+        for sent, newline in units:
+            if not current:
+                current = sent
                 continue
-            if len(current) + len(sent) + 1 <= max_chars:
-                current = (current + " " + sent).strip() if current else sent
-            else:
-                if current:
-                    chunks.append(current)
-                # 문장 하나가 max_chars보다 길면 강제 분할
-                if len(sent) > max_chars:
-                    for i in range(0, len(sent), max_chars):
-                        chunks.append(sent[i:i + max_chars])
-                else:
-                    current = sent
-                    continue
+            sep = "\n" if newline else " "
+            if len(current) + len(sep) + len(sent) <= max_chars:
+                current += sep + sent
+                continue
+
+            chunks.append((current, starts_block))
+            # 잘린 자리가 줄바꿈이면 다음 청크는 새 줄 = 새 문단에서 시작한다
+            starts_block = newline
+            # 문장 하나가 max_chars보다 길면 강제 분할
+            if len(sent) > max_chars:
+                for i in range(0, len(sent), max_chars):
+                    chunks.append((sent[i:i + max_chars], starts_block))
+                    starts_block = False
                 current = ""
+            else:
+                current = sent
         if current:
-            chunks.append(current)
+            chunks.append((current, starts_block))
         return chunks
 
-    def _chunk_text(self, text, max_chars=500):
-        """텍스트를 청크로 분할 (문맥 보존, 문장 단위)"""
+    def _chunk_text_with_layout(self, text, max_chars=500):
+        """텍스트를 청크로 분할 (문맥 보존, 문장 단위).
+
+        반환: [(청크, 새 문단에서 시작하는가)]
+        청크 안의 '\n' / '\n\n' 은 원문 줄·문단 경계 그대로다. 자막 레이아웃이
+        이걸 근거로 <p>/<br> 를 찍으므로 여기서 공백으로 뭉개면 안 된다.
+        """
         # 텍스트 정규화 적용
         text = self._normalize_text(text)
 
@@ -887,7 +970,7 @@ class TTSWorker(QThread):
             # 단락이 max_chars보다 길면 문장 단위로 분할
             if len(para) > max_chars:
                 if current_chunk:
-                    chunks.append(current_chunk.strip())
+                    chunks.append((current_chunk.strip(), True))
                     current_chunk = ""
                 chunks.extend(self._split_long_paragraph(para, max_chars))
                 continue
@@ -896,15 +979,19 @@ class TTSWorker(QThread):
                 current_chunk = (current_chunk + "\n\n" + para).strip() if current_chunk else para
             else:
                 if current_chunk:
-                    chunks.append(current_chunk.strip())
+                    chunks.append((current_chunk.strip(), True))
                 current_chunk = para
 
         if current_chunk:
-            chunks.append(current_chunk.strip())
+            chunks.append((current_chunk.strip(), True))
 
         # 빈 청크 제거
-        chunks = [c for c in chunks if c.strip()]
-        return chunks if chunks else [text[:max_chars]]
+        chunks = [(c, b) for c, b in chunks if c.strip()]
+        return chunks if chunks else [(text[:max_chars], True)]
+
+    def _chunk_text(self, text, max_chars=500):
+        """텍스트를 청크로 분할 (레이아웃 정보 없이 청크 문자열만)."""
+        return [c for c, _ in self._chunk_text_with_layout(text, max_chars)]
 
     def _convert_wav_to_mp3(self, wav_path):
         """WAV → MP3 변환 후 WAV 삭제. 성공 시 mp3 경로 반환."""

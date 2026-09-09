@@ -11,6 +11,7 @@ audiofiles/
 config.json
 app.log
 nohup.out
+voicebook_nohup.log
 
 # 로컬 전용 (커밋 금지)
 telegram_config.json
