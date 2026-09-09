@@ -159,12 +159,98 @@ class DocumentParser:
         except Exception as e:
             raise Exception(f"EPUB 파싱 오류: {str(e)}")
     
+
+    # 마크다운 표 (| a | b |) 와 구분선 (|---|---|)
+    _MD_TABLE_ROW = re.compile(r'^\s*\|.*\|\s*$')
+    # 수평선 (---, ***, ___)
+    _MD_HRULE = re.compile(r'^\s*([-*_])(\s*\1){2,}\s*$')
+    # setext 제목 밑줄 (=== 또는 ---)
+    _MD_SETEXT = re.compile(r'^\s*(=+|-+)\s*$')
+    # 링크 참조 정의 ([ref]: http://...)
+    _MD_LINK_DEF = re.compile(r'^\s*\[[^\]]+\]:\s*\S+.*$')
+
+    @classmethod
+    def parse_md(cls, filepath):
+        """마크다운 파싱 - 문법 기호는 걷어내고 줄·문단 구조는 그대로 둔다.
+
+        읽어 주는 용도이므로 '##' 이나 '**' 가 그대로 낭독되면 안 된다.
+        반대로 줄바꿈은 자막 문단 나누기의 근거이니 반드시 보존해야 한다
+        (srt_writer 의 레이아웃 사이드카 참조).
+
+        표는 뺀다 - PDF/DOCX/EPUB 파서도 표를 제외하므로 결을 맞춘다.
+        """
+        text = cls.parse_txt(filepath)
+
+        # YAML 프론트매터 (--- ... ---) 제거
+        text = re.sub(r'\A\s*---\s*\n.*?\n---\s*(\n|$)', '', text, flags=re.DOTALL)
+
+        # 코드 펜스는 울타리만 걷어내고 내용은 남긴다 (내용을 지우면 본문이 사라진다)
+        text = re.sub(r'^\s*(```+|~~~+).*$', '', text, flags=re.MULTILINE)
+
+        lines = []
+        for line in text.split('\n'):
+            # 표와 수평선, 링크 정의는 통째로 뺀다
+            if (cls._MD_TABLE_ROW.match(line) or cls._MD_HRULE.match(line)
+                    or cls._MD_LINK_DEF.match(line)):
+                continue
+
+            # 인용부호와 목록 기호 제거 (중첩 인용 '> > ' 도 함께)
+            line = re.sub(r'^\s*(>\s?)+', '', line)
+            line = re.sub(r'^(\s*)[-*+]\s+', r'\1', line)
+            # 순서 있는 목록의 번호는 뜻이 있으니 남긴다 ("1. 정의")
+
+            # ATX 제목: '## 제목 ##' → '제목'
+            line = re.sub(r'^\s*#{1,6}\s+', '', line)
+            line = re.sub(r'\s+#+\s*$', '', line)
+
+            lines.append(line)
+
+        # setext 제목의 밑줄(=== / ---)은 제목 바로 뒤에 올 때만 뺀다
+        out = []
+        for line in lines:
+            if (cls._MD_SETEXT.match(line) and out and out[-1].strip()):
+                continue
+            out.append(line)
+        text = '\n'.join(out)
+
+        # 이미지는 통째로 제거 (경로를 읽어 줄 이유가 없다)
+        text = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', text)
+        text = re.sub(r'!\[\[[^\]]*\]\]', '', text)
+        # 링크는 보이는 글자만 남긴다
+        text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)      # [글자](url)
+        text = re.sub(r'\[([^\]]*)\]\[[^\]]*\]', r'\1', text)    # [글자][ref]
+        text = re.sub(r'\[\[([^\]|]*)\|([^\]]*)\]\]', r'\2', text)  # [[문서|표시글자]]
+        text = re.sub(r'\[\[([^\]]*)\]\]', r'\1', text)          # [[위키링크]]
+        text = re.sub(r'\[\^[^\]]*\]', '', text)                  # 각주 표시 [^1]
+        text = re.sub(r'<(https?://[^>\s]+)>', '', text)          # 자동 링크 <http://...>
+
+        # 남은 HTML 태그 제거
+        text = re.sub(r'<[^>\n]+>', '', text)
+
+        # 강조/코드 기호 제거 (기호를 감싼 글자만 남긴다)
+        text = re.sub(r'\*\*\*(.+?)\*\*\*', r'\1', text, flags=re.DOTALL)
+        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text, flags=re.DOTALL)
+        text = re.sub(r'(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)', r'\1', text)
+        text = re.sub(r'(?<!\w)__(?!\s)(.+?)(?<!\s)__(?!\w)', r'\1', text)
+        text = re.sub(r'(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)', r'\1', text)
+        text = re.sub(r'~~(.+?)~~', r'\1', text)
+        text = re.sub(r'`+([^`\n]+)`+', r'\1', text)
+        text = re.sub(r'==(.+?)==', r'\1', text)                  # 옵시디언 형광펜
+
+        # 줄 안쪽 공백만 정리하고 개행은 보존
+        text = re.sub(r'[^\S\n]+', ' ', text)
+        text = re.sub(r' *\n *', '\n', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
+
     @classmethod
     def parse(cls, filepath):
         """파일 확장자에 따라 자동 파싱"""
         ext = os.path.splitext(filepath)[1].lower()
         parsers = {
             '.txt': cls.parse_txt,
+            '.md': cls.parse_md,
+            '.markdown': cls.parse_md,
             '.rtf': cls.parse_rtf,
             '.pdf': cls.parse_pdf,
             '.docx': cls.parse_docx,
@@ -177,7 +263,7 @@ class DocumentParser:
     @classmethod
     def get_supported_extensions(cls):
         """지원하는 파일 확장자 목록"""
-        exts = ['.txt']
+        exts = ['.txt', '.md']
         if PDF_AVAILABLE:
             exts.append('.pdf')
         if DOCX_AVAILABLE:

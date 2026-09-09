@@ -110,7 +110,7 @@ python voicebook_studio_v1.0.py
 ## 🎯 사용법
 
 1. **파일 선택**: 드래그앤드롭 또는 클릭
-   - 지원: TXT, RTF, PDF, DOCX, EPUB
+   - 지원: TXT, MD, RTF, PDF, DOCX, EPUB
 
 2. **또는 직접 입력**: 탭 전환 후 텍스트 입력
 

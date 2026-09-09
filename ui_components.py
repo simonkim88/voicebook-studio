@@ -21,7 +21,7 @@ class DropArea(QLabel):
     def __init__(self):
         super().__init__()
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setText("📚\n파일을 여기로 드래그하세요\n또는 클릭해서 파일 선택\n\n(지원: TXT, RTF, PDF, DOCX, EPUB)")
+        self.setText("📚\n파일을 여기로 드래그하세요\n또는 클릭해서 파일 선택\n\n(지원: TXT, MD, RTF, PDF, DOCX, EPUB)")
         # 책/오디오북 테마 스타일 - 부드러운 그라데이션과 패턴
         self.setStyleSheet("""
             QLabel {
@@ -73,7 +73,7 @@ class DropArea(QLabel):
     def mousePressEvent(self, event):
         file_path, _ = QFileDialog.getOpenFileName(
             self, "파일 선택", "",
-            "Documents (*.txt *.rtf *.pdf *.docx *.epub);;All Files (*)"
+            "Documents (*.txt *.md *.markdown *.rtf *.pdf *.docx *.epub);;All Files (*)"
         )
         if file_path:
             self.file_dropped.emit(file_path)
